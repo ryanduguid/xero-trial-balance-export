@@ -1,6 +1,6 @@
 """Xero API client: token cache, rotation-safe refresh, authed GET.
 
-Xero refresh tokens are single-use — every refresh returns a NEW refresh
+Xero refresh tokens are single-use - every refresh returns a NEW refresh
 token, and the old one survives only a 30-minute grace period. A script
 that fails to persist the new refresh token recovers if it reruns inside
 that window and is locked out after it. Two defences here:
@@ -47,13 +47,13 @@ def save_tokens(token_response: dict) -> None:
 
 def load_tokens() -> dict:
     if not os.path.exists(TOKEN_FILE):
-        raise SystemExit("No token.json — run: python auth.py")
+        raise SystemExit("No token.json - run: python auth.py")
     with open(TOKEN_FILE) as fh:
         try:
             return json.load(fh)
         except (json.JSONDecodeError, UnicodeDecodeError):
             raise SystemExit(
-                "token.json is unreadable or corrupt — delete it and "
+                "token.json is unreadable or corrupt - delete it and "
                 "run: python auth.py"
             ) from None
 
@@ -61,7 +61,7 @@ def load_tokens() -> dict:
 def get_access_token(client_id: str, client_secret: str, force: bool = False) -> str:
     """Return a live access token, refreshing (and re-persisting) if needed.
 
-    force=True skips the local expiry check — for when a cached token looked
+    force=True skips the local expiry check - for when a cached token looked
     fresh but Xero returned 401 anyway (skewed clock, token.json copied from
     another machine).
     """
@@ -86,7 +86,7 @@ def get_access_token(client_id: str, client_secret: str, force: bool = False) ->
         )
     resp.raise_for_status()
     new_tokens = resp.json()
-    save_tokens(new_tokens)  # persist BEFORE using — rotation safety
+    save_tokens(new_tokens)  # persist BEFORE using - rotation safety
     return new_tokens["access_token"]
 
 
@@ -99,10 +99,10 @@ def api_get(
     """GET a Xero API URL with auth headers. One polite retry on 429.
 
     The access token is looked up via get_access_token() per call, never
-    passed in — a token captured once by a caller goes stale the moment any
+    passed in - a token captured once by a caller goes stale the moment any
     call refreshes it, and every later call then repeats the 401 + forced
     refresh, burning a single-use refresh token each time. A surprise 401
-    still gets one forced refresh and retry — the local expiry math can lie
+    still gets one forced refresh and retry - the local expiry math can lie
     (skewed clock, stale cache). A second 401 exits with the same
     re-authorise guidance the invalid_grant path gives, instead of a raw
     traceback.

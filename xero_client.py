@@ -16,6 +16,7 @@ import json
 import os
 import tempfile
 import time
+from datetime import datetime, timedelta
 
 import requests
 
@@ -31,6 +32,32 @@ EXPIRY_MARGIN = 60
 # possible. Ride out a brief lock rather than losing the new refresh token.
 REPLACE_ATTEMPTS = 5
 REPLACE_BACKOFF = 0.2
+
+# 429 backoff bounds. Xero's per-minute limit resets in under a minute, but
+# the daily limit answers with a Retry-After measured in hours. Sleeping on
+# that pins a scheduled export for the rest of the day, so cap the wait and
+# exit instead.
+RETRY_AFTER_DEFAULT = 5
+RETRY_AFTER_MAX = 60
+
+
+def parse_retry_after(raw: object) -> int:
+    """Seconds to wait from a Retry-After header value.
+
+    Only the delta-seconds form is honoured. A missing header, an HTTP-date,
+    a negative number or any other junk lands on RETRY_AFTER_DEFAULT rather
+    than raising: the header is server-supplied and must never be able to
+    crash the retry.
+    """
+    if raw is None:
+        return RETRY_AFTER_DEFAULT
+    try:
+        seconds = int(str(raw).strip())
+    except (TypeError, ValueError):
+        return RETRY_AFTER_DEFAULT
+    if seconds < 0:
+        return RETRY_AFTER_DEFAULT
+    return seconds
 
 
 def save_tokens(token_response: dict) -> None:
@@ -133,7 +160,11 @@ def api_get(
     tenant_id: str | None = None,
     params: dict | None = None,
 ) -> dict:
-    """GET a Xero API URL with auth headers. One polite retry on 429.
+    """GET a Xero API URL with auth headers. One capped retry on 429.
+
+    The 429 wait comes from a server-supplied Retry-After, so it is parsed
+    defensively and capped: a daily-limit response asking for hours exits
+    with the reset time instead of holding the process.
 
     The access token is looked up via get_access_token() per call, never
     passed in - a token captured once by a caller goes stale the moment any
@@ -153,9 +184,22 @@ def api_get(
 
     resp = requests.get(url, headers=headers, params=params, timeout=30)
     if resp.status_code == 429:
-        wait = int(resp.headers.get("Retry-After", "5"))
+        wait = parse_retry_after(resp.headers.get("Retry-After"))
+        if wait > RETRY_AFTER_MAX:
+            reset_at = datetime.now().astimezone() + timedelta(seconds=wait)
+            raise SystemExit(
+                f"error: Xero rate limit hit and asked for a {wait}s wait, over "
+                f"the {RETRY_AFTER_MAX}s cap this script will sleep for. The "
+                f"limit resets at {reset_at.isoformat(timespec='seconds')} - "
+                "re-run after that."
+            )
         time.sleep(wait)
         resp = requests.get(url, headers=headers, params=params, timeout=30)
+        if resp.status_code == 429:
+            raise SystemExit(
+                f"error: Xero is still rate limiting after a {wait}s wait - "
+                "re-run later."
+            )
     if resp.status_code == 401:
         headers["Authorization"] = f"Bearer {get_access_token(*credentials, force=True)}"
         resp = requests.get(url, headers=headers, params=params, timeout=30)

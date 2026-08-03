@@ -14,7 +14,9 @@ configure in the developer portal.
 import os
 import re
 import secrets
+import socket
 import sys
+import time
 import webbrowser
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.parse import urlencode, urlparse, parse_qs
@@ -35,6 +37,45 @@ SCOPES = "offline_access accounting.reports.trialbalance.read"
 # whatever the browser was pointed at, so anything else - escape sequences,
 # newlines, a fake instruction - never reaches the terminal verbatim.
 ERROR_CODE = re.compile(r"[A-Za-z0-9_]{1,64}")
+
+# Wall-clock budget for the browser round trip. Without it a consent the
+# user never finishes, or one whose callback went somewhere else, leaves the
+# script serving forever.
+CALLBACK_TIMEOUT = 300
+
+
+class _CallbackServer(HTTPServer):
+    """Holds the callback port exclusively.
+
+    HTTPServer sets allow_reuse_address = 1. On Windows that means
+    SO_REUSEADDR, which lets bind() succeed on a port another process is
+    already listening on; whichever socket the OS picks then receives the
+    authorisation code, and it may not be this one. Refusing the port is the
+    only safe answer, so allow_reuse_address is off and, on Windows,
+    SO_EXCLUSIVEADDRUSE is set before the bind. A port already in use now
+    raises OSError up front.
+    """
+
+    allow_reuse_address = False
+
+    def server_bind(self):
+        exclusive = getattr(socket, "SO_EXCLUSIVEADDRUSE", None)
+        if os.name == "nt" and exclusive is not None:
+            self.socket.setsockopt(socket.SOL_SOCKET, exclusive, 1)
+        super().server_bind()
+
+
+def wait_for_callback(server, timeout: float = CALLBACK_TIMEOUT) -> None:
+    """Serve requests until the callback lands or the deadline passes."""
+    deadline = time.monotonic() + timeout
+    while server.auth_code is None and server.auth_error is None:
+        if time.monotonic() >= deadline:
+            raise SystemExit(
+                f"error: no Xero callback arrived within {int(timeout)} seconds. "
+                "Nothing was saved. Run again and complete the consent in the "
+                "browser."
+            )
+        server.handle_request()
 
 
 class _CallbackHandler(BaseHTTPRequestHandler):
@@ -84,7 +125,17 @@ def main() -> None:
     )
     url = f"{AUTHORIZE_URL}?{query}"
 
-    server = HTTPServer((parsed_redirect.hostname, parsed_redirect.port), _CallbackHandler)
+    try:
+        server = _CallbackServer(
+            (parsed_redirect.hostname, parsed_redirect.port), _CallbackHandler
+        )
+    except OSError as exc:
+        sys.exit(
+            f"error: cannot listen on {parsed_redirect.hostname}:"
+            f"{parsed_redirect.port} for the OAuth callback ({exc}). Something "
+            "else holds that port. Close it, or point XERO_REDIRECT_URI at a "
+            "free port and add the same URI to the app at developer.xero.com."
+        )
     server.callback_path = parsed_redirect.path
     server.auth_code = None
     server.auth_error = None
@@ -98,8 +149,10 @@ def main() -> None:
         print("Could not open a browser (SSH or headless session?). Paste this URL into one:")
     print(f"  {url}")
 
-    while server.auth_code is None and server.auth_error is None:
-        server.handle_request()
+    try:
+        wait_for_callback(server)
+    finally:
+        server.server_close()
 
     # State first: neither the code nor the error is worth trusting until the
     # callback is proved to be the one this run started.

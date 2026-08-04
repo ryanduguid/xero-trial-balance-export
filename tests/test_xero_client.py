@@ -168,6 +168,17 @@ class ParseRetryAfterTest(unittest.TestCase):
             xero_client.RETRY_AFTER_CLAMP,
         )
 
+    def test_a_value_past_the_int_conversion_limit_is_clamped(self):
+        """int() raises ValueError above 4300 digits, which nothing catches."""
+        self.assertEqual(
+            xero_client.parse_retry_after("9" * 5000),
+            xero_client.RETRY_AFTER_CLAMP,
+        )
+
+    def test_leading_zeros_do_not_look_like_a_huge_value(self):
+        self.assertEqual(xero_client.parse_retry_after("0000000017"), 17)
+        self.assertEqual(xero_client.parse_retry_after("000"), 0)
+
 
 class ApiGet429Test(unittest.TestCase):
     def setUp(self):

@@ -116,9 +116,13 @@ def to_number(value: str) -> Decimal:
     # unequal to everything including itself, so it would reach the balance
     # check and the CSV as a number. Neither is an amount.
     if amount is None or not amount.is_finite():
+        # The cell is whatever the API sent. Escape sequences and newlines
+        # never reach the terminal verbatim, same rule auth.py applies to
+        # the OAuth error code.
+        shown = "".join(ch for ch in text[:40] if ch.isprintable())
         raise SystemExit(
-            f'error: report cell "{text}" is not an amount. The API shape may '
-            "have changed, or this is not a trial balance report."
+            f'error: report cell "{shown}" is not an amount. The API shape '
+            "may have changed, or this is not a trial balance report."
         )
     return amount
 

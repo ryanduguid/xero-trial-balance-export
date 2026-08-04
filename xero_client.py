@@ -71,7 +71,13 @@ def parse_retry_after(raw: object) -> int:
     text = str(raw).strip()
     if not DELTA_SECONDS.fullmatch(text):
         return RETRY_AFTER_DEFAULT
-    return min(int(text), RETRY_AFTER_CLAMP)
+    # int() refuses a string of more than 4300 digits (CPython's conversion
+    # limit) by raising ValueError, so count digits before converting. More
+    # digits than the clamp has means the value is above it whatever it is.
+    digits = text.lstrip("0") or "0"
+    if len(digits) > len(str(RETRY_AFTER_CLAMP)):
+        return RETRY_AFTER_CLAMP
+    return min(int(digits), RETRY_AFTER_CLAMP)
 
 
 def save_tokens(token_response: dict) -> None:

@@ -31,6 +31,8 @@ Options: `--tenant "name"` (substring match when multiple orgs are connected), `
 
 Every export runs a balance check before anything touches disk - both pairs must balance (movement **and** YTD), and the expected report columns must all be present; otherwise no file is written and the script exits non-zero, so a truncated or reshaped report can never slip into a refresh pipeline.
 
+Amounts are parsed and totalled as `Decimal`, never `float`, and the balance check compares the totals exactly rather than rounding to two decimal places first. Binary floating point cannot hold every cent, and the error compounds row by row, so a report that is genuinely out can total to zero. The exported figures carry the digits Xero sent.
+
 The CSV is written as UTF-8 with a BOM (`utf-8-sig`): Excel's double-click open needs the BOM to decode non-ASCII account names correctly, and Power BI and pandas strip it automatically.
 
 ## Power BI

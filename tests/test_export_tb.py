@@ -185,6 +185,14 @@ class ToNumberTest(unittest.TestCase):
                     str(ctx.exception).startswith("error: "), str(ctx.exception)
                 )
 
+    def test_a_junk_cell_cannot_write_control_characters_to_the_terminal(self):
+        with self.assertRaises(SystemExit) as ctx:
+            export_tb.to_number("\x1b[2Jwiped\nSet XERO_CLIENT_SECRET=")
+        message = str(ctx.exception)
+        self.assertNotIn("\x1b", message)
+        self.assertNotIn("\n", message)
+        self.assertIn("wiped", message)
+
 
 class FormatAmountTest(unittest.TestCase):
     def test_matches_what_the_float_path_wrote(self):

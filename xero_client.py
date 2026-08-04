@@ -14,6 +14,7 @@ that window and is locked out after it. Two defences here:
 
 import json
 import os
+import re
 import tempfile
 import time
 from datetime import datetime, timedelta
@@ -40,24 +41,37 @@ REPLACE_BACKOFF = 0.2
 RETRY_AFTER_DEFAULT = 5
 RETRY_AFTER_MAX = 60
 
+# Upper bound on the parsed value. The cap message turns it into a reset
+# timestamp, and timedelta(seconds=...) overflows on a large enough number:
+# 10**12 raises "date value out of range" and 10**13 raises "Python int too
+# large to convert to C int", both as tracebacks. A day is longer than any
+# Xero limit window, so anything above it is server junk either way.
+RETRY_AFTER_CLAMP = 86400
+
+# RFC 9110 delta-seconds is 1*DIGIT and nothing else. int() is wider than
+# that grammar: it takes underscores ("1_0" -> 10), a leading sign ("+7" ->
+# 7) and Unicode digits, so a header the spec does not allow would set a
+# wait the docstring promises to refuse.
+DELTA_SECONDS = re.compile(r"[0-9]+")
+
 
 def parse_retry_after(raw: object) -> int:
     """Seconds to wait from a Retry-After header value.
 
     Only the delta-seconds form is honoured. A missing header, an HTTP-date,
-    a negative number or any other junk lands on RETRY_AFTER_DEFAULT rather
-    than raising: the header is server-supplied and must never be able to
-    crash the retry.
+    a signed or underscored number or any other junk lands on
+    RETRY_AFTER_DEFAULT rather than raising: the header is server-supplied
+    and must never be able to crash the retry.
+
+    The result is clamped to RETRY_AFTER_CLAMP, so every caller can do
+    arithmetic on it without an overflow check of its own.
     """
     if raw is None:
         return RETRY_AFTER_DEFAULT
-    try:
-        seconds = int(str(raw).strip())
-    except (TypeError, ValueError):
+    text = str(raw).strip()
+    if not DELTA_SECONDS.fullmatch(text):
         return RETRY_AFTER_DEFAULT
-    if seconds < 0:
-        return RETRY_AFTER_DEFAULT
-    return seconds
+    return min(int(text), RETRY_AFTER_CLAMP)
 
 
 def save_tokens(token_response: dict) -> None:
@@ -186,12 +200,14 @@ def api_get(
     if resp.status_code == 429:
         wait = parse_retry_after(resp.headers.get("Retry-After"))
         if wait > RETRY_AFTER_MAX:
+            # wait is clamped by parse_retry_after, so this addition cannot
+            # overflow however large the header was.
             reset_at = datetime.now().astimezone() + timedelta(seconds=wait)
             raise SystemExit(
                 f"error: Xero rate limit hit and asked for a {wait}s wait, over "
                 f"the {RETRY_AFTER_MAX}s cap this script will sleep for. The "
-                f"limit resets at {reset_at.isoformat(timespec='seconds')} - "
-                "re-run after that."
+                f"limit resets at or after "
+                f"{reset_at.isoformat(timespec='seconds')} - re-run after that."
             )
         time.sleep(wait)
         resp = requests.get(url, headers=headers, params=params, timeout=30)

@@ -119,6 +119,26 @@ class ParseRetryAfterTest(unittest.TestCase):
                     xero_client.RETRY_AFTER_DEFAULT,
                 )
 
+    def test_values_outside_the_delta_seconds_grammar_are_refused(self):
+        """int() accepts syntax RFC 9110 delta-seconds does not."""
+        # The escape below is ARABIC-INDIC DIGIT THREE, which int() reads as 3.
+        for raw in ("1_0", "+7", "\u0663", "7 7", "0x10"):
+            with self.subTest(raw=raw):
+                self.assertEqual(
+                    xero_client.parse_retry_after(raw),
+                    xero_client.RETRY_AFTER_DEFAULT,
+                )
+
+    def test_an_enormous_value_is_clamped(self):
+        self.assertEqual(
+            xero_client.parse_retry_after("1000000000000"),
+            xero_client.RETRY_AFTER_CLAMP,
+        )
+        self.assertEqual(
+            xero_client.parse_retry_after("10" * 400),
+            xero_client.RETRY_AFTER_CLAMP,
+        )
+
 
 class ApiGet429Test(unittest.TestCase):
     def setUp(self):
@@ -156,6 +176,25 @@ class ApiGet429Test(unittest.TestCase):
         sleep.assert_not_called()
         self.assertTrue(message.startswith("error: "), message)
         self.assertIn(str(over), message)
+        self.assertIn("resets at", message)
+
+    def test_an_enormous_retry_after_exits_instead_of_overflowing(self):
+        """The cap message does date arithmetic on the parsed wait.
+
+        Unclamped, timedelta(seconds=10**12) raises OverflowError as a
+        traceback, which is the opposite of the clean exit the cap promises.
+        """
+        with mock.patch.object(
+            xero_client.requests,
+            "get",
+            return_value=_Resp(429, {"Retry-After": "1000000000000"}),
+        ), mock.patch.object(xero_client.time, "sleep") as sleep:
+            with self.assertRaises(SystemExit) as ctx:
+                xero_client.api_get("https://example.test", ("id", "secret"))
+
+        message = str(ctx.exception)
+        sleep.assert_not_called()
+        self.assertTrue(message.startswith("error: "), message)
         self.assertIn("resets at", message)
 
     def test_a_second_429_exits_instead_of_raising_for_status(self):

@@ -130,6 +130,37 @@ class SilentConnectionTest(unittest.TestCase):
         self.assertLess(result["elapsed"], budget)
 
 
+class RealCallbackTest(unittest.TestCase):
+    """A genuine redirect must still be caught, read timeout and all."""
+
+    def test_the_callback_query_reaches_the_server(self):
+        port = _free_port()
+        server = auth._CallbackServer(("127.0.0.1", port), auth._CallbackHandler)
+        self.addCleanup(server.server_close)
+        server.callback_path = "/callback"
+        server.auth_code = None
+        server.auth_error = None
+        server.returned_state = None
+        server.timeout = 0.2
+
+        def send_redirect():
+            with socket.create_connection(("127.0.0.1", port), timeout=5) as sock:
+                sock.sendall(
+                    b"GET /callback?code=the-code&state=the-state HTTP/1.1\r\n"
+                    b"Host: 127.0.0.1\r\nConnection: close\r\n\r\n"
+                )
+                sock.recv(1024)
+
+        caller = threading.Thread(target=send_redirect, daemon=True)
+        caller.start()
+        auth.wait_for_callback(server, timeout=10)
+        caller.join(timeout=5)
+
+        self.assertEqual(server.auth_code, "the-code")
+        self.assertEqual(server.returned_state, "the-state")
+        self.assertIsNone(server.auth_error)
+
+
 class ParseRedirectTest(unittest.TestCase):
     def test_a_usable_uri_is_split(self):
         self.assertEqual(

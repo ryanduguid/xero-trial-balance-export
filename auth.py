@@ -99,14 +99,27 @@ def parse_redirect(redirect_uri: str):
     # browser is sent to port 0, no callback can arrive, and the user waits
     # out the full CALLBACK_TIMEOUT for an error blaming the consent flow.
     if (
-        parsed.scheme not in ("http", "https")
+        parsed.scheme != "http"
         or not parsed.hostname
         or not port
         or not parsed.path.startswith("/")
     ):
+        # https is named separately because it is the plausible mistake, and
+        # it fails in the most confusing way available: the local callback
+        # server speaks plain HTTP, so the browser's TLS handshake fails, no
+        # callback arrives, and the user waits out the full CALLBACK_TIMEOUT
+        # for an error blaming the consent flow.
+        if parsed.scheme == "https":
+            raise SystemExit(
+                f"error: XERO_REDIRECT_URI is set to '{redirect_uri}', but the "
+                "callback server this script runs speaks plain HTTP. An https "
+                "URI fails the browser's TLS handshake and no callback ever "
+                "arrives. Use http://localhost:8400/callback here and on the "
+                "app at developer.xero.com; Xero allows http for localhost."
+            )
         raise SystemExit(
             f"error: XERO_REDIRECT_URI is set to '{redirect_uri}', which this "
-            "script cannot listen on. It needs a scheme, an explicit "
+            "script cannot listen on. It needs the http scheme, an explicit "
             "host:port and a path, as in http://localhost:8400/callback. Use "
             "the same URI here and on the app at developer.xero.com."
         )

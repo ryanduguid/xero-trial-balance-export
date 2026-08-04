@@ -387,3 +387,26 @@ class CallbackOrderingTest(unittest.TestCase):
 def _auth_source() -> str:
     with open(auth.__file__, encoding="utf-8") as handle:
         return handle.read()
+
+
+class HttpsRedirectTest(unittest.TestCase):
+    """https is the plausible mistake and it fails in the worst way.
+
+    The callback server speaks plain HTTP, so an https redirect URI fails the
+    browser's TLS handshake, no callback arrives, and the user waits out the
+    full CALLBACK_TIMEOUT for an error blaming the consent flow.
+    """
+
+    def test_an_https_uri_is_refused_with_its_own_reason(self):
+        with self.assertRaises(SystemExit) as ctx:
+            auth.parse_redirect("https://localhost:8400/callback")
+        message = str(ctx.exception)
+        self.assertIn("plain HTTP", message)
+        self.assertIn("TLS", message)
+        self.assertIn("http://localhost:8400/callback", message)
+
+    def test_the_http_uri_it_recommends_actually_passes(self):
+        self.assertEqual(
+            auth.parse_redirect("http://localhost:8400/callback"),
+            ("localhost", 8400, "/callback"),
+        )

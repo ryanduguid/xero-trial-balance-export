@@ -1,4 +1,4 @@
-# Secrets and tokens — never committed
+# Secrets and tokens - never committed
 .env*
 !.env.example
 token.json

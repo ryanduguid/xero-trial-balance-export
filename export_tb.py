@@ -4,14 +4,14 @@ Usage:
     python export_tb.py --date 2026-06-30
     python export_tb.py --date 2026-06-30 --tenant "Demo Company" --out tb.csv
 
-Output: one row per account —
+Output: one row per account:
     ReportDate, Tenant, Section, AccountID, AccountName, AccountCode,
     Debit, Credit, YTDDebit, YTDCredit
 
 Column semantics per Xero's report: Debit/Credit are the CURRENT MONTH's
 movement up to the report date; YTDDebit/YTDCredit are the cumulative as-at
 balances (the pair an accountant means by "trial balance"). AccountID is the
-account GUID — the stable join key.
+account GUID - the stable join key.
 
 The balance check covers both pairs (movement and YTD) and runs before
 anything is written; an unbalanced report (truncated or misparsed) writes
@@ -39,7 +39,7 @@ ACCOUNT_PATTERN = re.compile(r"^(?P<name>.*?)\s*\((?P<code>[^()]+)\)\s*$")
 
 def is_account_code(value: str) -> bool:
     """A code is alphanumeric, at most 10 characters, with at least one digit
-    ("090", "GST1") — the same test the sibling repo's Power Query parser
+    ("090", "GST1") - the same test the sibling repo's Power Query parser
     applies. Anything else belongs to the name: "Term Deposit (NAB)" and
     "Rent (Sydney)" keep their parenthetical and export an empty code, which
     is what Xero's code-less bank and credit-card accounts carry anyway.
@@ -52,7 +52,7 @@ def flatten_report(report: dict) -> tuple[list[str], list[dict]]:
 
     Xero reports arrive as: Rows[] where RowType is Header (column titles),
     Section (Title + nested Rows), or Row/SummaryRow. Cell order follows the
-    Header titles. SummaryRow (section totals) is skipped — totals are
+    Header titles. SummaryRow (section totals) is skipped - totals are
     recomputed, not trusted.
     """
     column_titles: list[str] = []
@@ -63,7 +63,7 @@ def flatten_report(report: dict) -> tuple[list[str], list[dict]]:
 
     def account_id(row: dict) -> str:
         # Every data cell carries Attributes: [{"Value": "<account guid>",
-        # "Id": "account"}] — the stable join key; codes and names change.
+        # "Id": "account"}] - the stable join key; codes and names change.
         cells = row.get("Cells", [])
         if not cells:
             return ""
@@ -84,7 +84,7 @@ def flatten_report(report: dict) -> tuple[list[str], list[dict]]:
                 values = cell_values(row)
                 record = {}
                 # strict: a row/header length mismatch means the API shape
-                # changed — fail loudly instead of exporting silent zeros
+                # changed - fail loudly instead of exporting silent zeros
                 for title, value in zip(column_titles, values, strict=True):
                     record[title] = value
                 # synthetic keys set last so they win any header collision
@@ -160,7 +160,7 @@ def excel_safe(value: str) -> str:
 
 
 def main() -> None:
-    # Non-console stdout on Windows is cp1252, not UTF-8 (PEP 528) — a macron
+    # Non-console stdout on Windows is cp1252, not UTF-8 (PEP 528) - a macron
     # or CJK character in an org name must not abort a redirected or piped run
     # before the report is ever fetched.
     for stream in (sys.stdout, sys.stderr):
@@ -182,14 +182,14 @@ def main() -> None:
     parser.add_argument("--payments-only", action="store_true", help="Cash-basis report")
     args = parser.parse_args()
 
-    # api_get looks the access token up fresh per call — no token is held
+    # api_get looks the access token up fresh per call - no token is held
     # here, so a mid-run refresh can never leave a later call using the
     # stale one; the creds also cover the surprise-401 forced refresh
     creds = (client_id, client_secret)
 
     connections = get_connections(creds)
     if not connections:
-        sys.exit("No Xero organisations authorised for this app — run auth.py again.")
+        sys.exit("No Xero organisations authorised for this app - run auth.py again.")
     if args.tenant:
         matches = [c for c in connections if args.tenant.lower() in c["tenantName"].lower()]
         if not matches:
@@ -197,12 +197,12 @@ def main() -> None:
             sys.exit(f'No tenant matching "{args.tenant}". Connected: {names}')
         if len(matches) > 1:
             names = ", ".join(c["tenantName"] for c in matches)
-            sys.exit(f'"{args.tenant}" matches more than one organisation ({names}) — narrow it.')
+            sys.exit(f'"{args.tenant}" matches more than one organisation ({names}) - narrow it.')
         tenant = matches[0]
     else:
         if len(connections) > 1:
             names = ", ".join(c["tenantName"] for c in connections)
-            sys.exit(f"More than one organisation connected ({names}) — pick one with --tenant.")
+            sys.exit(f"More than one organisation connected ({names}) - pick one with --tenant.")
         tenant = connections[0]
     print(f"Tenant: {tenant['tenantName']}")
 
@@ -213,18 +213,18 @@ def main() -> None:
     payload = api_get(REPORT_URL, creds, tenant_id=tenant["tenantId"], params=params)
     reports = payload.get("Reports", [])
     if not reports:
-        sys.exit("Empty Reports payload — check the date parameter and API scopes.")
+        sys.exit("Empty Reports payload - check the date parameter and API scopes.")
 
     column_titles, rows = flatten_report(reports[0])
     if not rows:
-        sys.exit("Report contained no account rows — nothing to export.")
+        sys.exit("Report contained no account rows - nothing to export.")
 
     # The strict zip in flatten_report only catches a cell-COUNT change; a
     # retitled column (count unchanged) would slip through and silently zero
     # every value via record.get(). Guard the titles themselves.
     missing = {"Account", "Debit", "Credit", "YTD Debit", "YTD Credit"} - set(column_titles)
     if missing:
-        sys.exit(f"Unexpected report columns — missing {sorted(missing)}. Has the API shape changed?")
+        sys.exit(f"Unexpected report columns - missing {sorted(missing)}. Has the API shape changed?")
 
     safe_tenant = re.sub(r"[^A-Za-z0-9._-]+", "-", tenant["tenantName"]).strip("-").lower()
     if not safe_tenant:  # all-symbol org names sanitise to nothing
@@ -240,7 +240,7 @@ def main() -> None:
         "Debit", "Credit", "YTDDebit", "YTDCredit",
     ]
 
-    # Build everything in memory and balance-check BEFORE any file exists —
+    # Build everything in memory and balance-check BEFORE any file exists -
     # a scheduled Power BI refresh reads the path, not the exit code, so an
     # unbalanced export must never reach disk.
     out_rows = []
@@ -278,7 +278,7 @@ def main() -> None:
             }
         )
 
-    # Both pairs must balance — the movement columns AND the YTD as-at
+    # Both pairs must balance - the movement columns AND the YTD as-at
     # balances (the pair the README tells users to slice). Either one out
     # means the report is truncated or misparsed.
     #
@@ -299,7 +299,7 @@ def main() -> None:
             )
             unbalanced = True
     if unbalanced:
-        print("Nothing written — report likely truncated or misparsed.")
+        print("Nothing written - report likely truncated or misparsed.")
         sys.exit(1)
 
     # Atomic write (temp file + replace), mirroring save_tokens(): a crash

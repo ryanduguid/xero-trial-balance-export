@@ -249,3 +249,79 @@ class ApiGet429Test(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class RetryAfterMessageTruthTest(unittest.TestCase):
+    """The cap message must report the header, not the clamp.
+
+    parse_retry_after clamps, and the message then printed the clamped number
+    as the value the server asked for. Anyone debugging the header was told a
+    figure Xero never sent.
+    """
+
+    def setUp(self):
+        patcher = mock.patch.object(
+            xero_client, "get_access_token", return_value="tok"
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def _exit_message(self, header):
+        with mock.patch.object(
+            xero_client.requests, "get", return_value=_Resp(429, {"Retry-After": header})
+        ), mock.patch.object(xero_client.time, "sleep") as sleep:
+            with self.assertRaises(SystemExit) as ctx:
+                xero_client.api_get("https://example.test", ("id", "secret"))
+        sleep.assert_not_called()
+        return str(ctx.exception)
+
+    def test_the_header_the_server_sent_is_quoted_back(self):
+        message = self._exit_message("1000000000000")
+        self.assertIn("1000000000000", message)
+        self.assertIn(f"{xero_client.RETRY_AFTER_MAX}s cap", message)
+
+    def test_the_clamp_is_named_as_a_clamp_not_as_the_reset(self):
+        message = self._exit_message("1000000000000")
+        self.assertIn("clamp", message)
+        self.assertIn("may", message)
+
+    def test_a_hostile_header_never_gets_as_far_as_the_message(self):
+        """parse_retry_after refuses anything outside the grammar and returns
+        the default, so a header carrying escape sequences takes the retry
+        path instead of the cap message. The strip in that message is
+        defence in depth for a future grammar change, not a live path - said
+        here so the next reader does not take it for a proven one."""
+        responses = [
+            _Resp(429, {"Retry-After": "999999\x1b[2J\nWARNING: fake"}),
+            _Resp(200, payload={"ok": True}),
+        ]
+        with mock.patch.object(
+            xero_client.requests, "get", side_effect=responses
+        ), mock.patch.object(xero_client.time, "sleep") as sleep:
+            result = xero_client.api_get("https://example.test", ("id", "secret"))
+        self.assertEqual(result, {"ok": True})
+        sleep.assert_called_once_with(xero_client.RETRY_AFTER_DEFAULT)
+
+
+class PortZeroTest(unittest.TestCase):
+    """Port 0 is the one number urlparse returns that cannot be listened on.
+
+    bind() takes it, the OS assigns a random ephemeral port, the browser is
+    sent to port 0, and the user waits out the full callback timeout for an
+    error blaming the consent flow.
+    """
+
+    def test_port_zero_is_refused(self):
+        import auth
+
+        with self.assertRaises(SystemExit) as ctx:
+            auth.parse_redirect("http://localhost:0/callback")
+        self.assertIn("XERO_REDIRECT_URI", str(ctx.exception))
+
+    def test_a_real_port_still_passes(self):
+        import auth
+
+        self.assertEqual(
+            auth.parse_redirect("http://localhost:8400/callback"),
+            ("localhost", 8400, "/callback"),
+        )

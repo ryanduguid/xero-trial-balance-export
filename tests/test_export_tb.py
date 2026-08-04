@@ -212,3 +212,52 @@ class FormatAmountTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class AbsurdMagnitudeTest(unittest.TestCase):
+    """Finite is not the same as usable.
+
+    Decimal's default context stops at Emax 999999, so "1E1000000" parses,
+    passes the is_finite guard, and then raises decimal.Overflow on the first
+    total_debit += debit. Overflow subclasses ArithmeticError, outside the
+    CLI's handler tuple, so it printed a traceback after the tenant name had
+    already gone to stdout. The float build it replaced exited cleanly on the
+    same payload, which makes this a regression the conversion introduced.
+    """
+
+    def test_an_exponent_past_the_decimal_context_is_refused(self):
+        with self.assertRaises(SystemExit) as ctx:
+            export_tb.to_number("1E1000000")
+        self.assertIn("digits long", str(ctx.exception))
+        self.assertTrue(str(ctx.exception).startswith("error: "))
+
+    def test_the_arithmetic_that_used_to_overflow_now_never_runs(self):
+        """The proof the guard is in the right place: without it, summing
+        two of these raises decimal.Overflow rather than reaching any check."""
+        from decimal import Overflow
+
+        with self.assertRaises(Overflow):
+            Decimal("1E1000000") + Decimal("1E1000000")
+        with self.assertRaises(SystemExit):
+            export_tb.to_number("1E1000000")
+
+    def test_a_million_digit_cell_is_refused_before_it_reaches_the_csv(self):
+        """Just under the overflow, "1E999999" totals fine and then makes
+        format_amount build a one-million-character CSV field."""
+        with self.assertRaises(SystemExit):
+            export_tb.to_number("1E999999")
+        with self.assertRaises(SystemExit):
+            export_tb.to_number("9" * 1000001)
+
+    def test_the_cell_is_stripped_before_it_reaches_the_terminal(self):
+        with self.assertRaises(SystemExit) as ctx:
+            export_tb.to_number("1E1000000\x1b[2J\nWARNING: fake")
+        message = str(ctx.exception)
+        self.assertNotIn("\x1b", message)
+        self.assertNotIn("\n", message.split("The API shape")[0])
+
+    def test_every_amount_a_real_ledger_holds_still_parses(self):
+        for cell in ("0", "0.00", "-1234.56", "1200.00", "1E20", "-1E29",
+                     "999999999999999999999999999999"):
+            with self.subTest(cell=cell):
+                self.assertIsInstance(export_tb.to_number(cell), Decimal)

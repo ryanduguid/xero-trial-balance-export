@@ -219,16 +219,24 @@ def api_get(
 
     resp = requests.get(url, headers=headers, params=params, timeout=30)
     if resp.status_code == 429:
-        wait = parse_retry_after(resp.headers.get("Retry-After"))
+        raw_retry_after = resp.headers.get("Retry-After")
+        wait = parse_retry_after(raw_retry_after)
         if wait > RETRY_AFTER_MAX:
             # wait is clamped by parse_retry_after, so this addition cannot
             # overflow however large the header was.
             reset_at = datetime.now().astimezone() + timedelta(seconds=wait)
+            # The header as sent, not the clamped number: reporting the clamp
+            # as the server's own figure told anyone debugging the header a
+            # value Xero never sent. Truncated and stripped of non-printables
+            # because it is remote input on its way to a terminal.
+            asked = "".join(ch for ch in str(raw_retry_after)[:40] if ch.isprintable())
             raise SystemExit(
-                f"error: Xero rate limit hit and asked for a {wait}s wait, over "
+                f"error: Xero rate limit hit and sent Retry-After: {asked}, over "
                 f"the {RETRY_AFTER_MAX}s cap this script will sleep for. The "
                 f"limit resets at or after "
-                f"{reset_at.isoformat(timespec='seconds')} - re-run after that."
+                f"{reset_at.isoformat(timespec='seconds')} - re-run after that "
+                f"(that timestamp is the {wait}s clamp, so the real reset may "
+                f"be later)."
             )
         time.sleep(wait)
         resp = requests.get(url, headers=headers, params=params, timeout=30)

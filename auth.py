@@ -16,6 +16,7 @@ import re
 import secrets
 import socket
 import sys
+import threading
 import time
 import webbrowser
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -50,6 +51,13 @@ CALLBACK_TIMEOUT = 300
 # and abandon them, which is enough to trigger it. A redirect from the
 # browser on loopback arrives in one packet, so two seconds is generous.
 CALLBACK_READ_TIMEOUT = 2
+
+# Total budget for one accepted connection, whatever it does inside it. The
+# read timeout above resets on every byte received, so a peer sending one
+# byte per second holds the connection open indefinitely and wait_for_callback
+# never gets to re-test its own deadline. This one does not reset. A real
+# browser redirect is finished inside a few milliseconds.
+CALLBACK_CONNECTION_TIMEOUT = 10
 
 
 class _CallbackServer(HTTPServer):
@@ -86,10 +94,14 @@ def parse_redirect(redirect_uri: str):
         port = parsed.port
     except ValueError:
         port = None
+    # Port 0 is the one number urlparse returns that this script cannot use:
+    # bind() takes it and the OS hands back a random ephemeral port, so the
+    # browser is sent to port 0, no callback can arrive, and the user waits
+    # out the full CALLBACK_TIMEOUT for an error blaming the consent flow.
     if (
         parsed.scheme not in ("http", "https")
         or not parsed.hostname
-        or port is None
+        or not port
         or not parsed.path.startswith("/")
     ):
         raise SystemExit(
@@ -121,9 +133,51 @@ class _CallbackHandler(BaseHTTPRequestHandler):
     accepted connection. Without it a peer that connects and sends nothing
     parks handle_request in rfile.readline() for as long as it likes, and
     wait_for_callback's deadline never comes around again.
+
+    That bounds one recv, not the connection. A peer that dribbles one byte
+    every second resets the per-read timeout forever and holds handle_request
+    open past any wall-clock deadline: measured at 26s against a 300s
+    CALLBACK_TIMEOUT, it never returned. So the connection also gets a hard
+    deadline - a timer that shuts the socket down underneath any pending
+    read, which makes rfile.readline() return and hands control back to
+    wait_for_callback so it can re-test its own deadline.
     """
 
     timeout = CALLBACK_READ_TIMEOUT
+
+    def setup(self):
+        super().setup()
+        self._expiry = threading.Timer(CALLBACK_CONNECTION_TIMEOUT, self._expire)
+        self._expiry.daemon = True
+        self._expiry.start()
+
+    def _expire(self):
+        try:
+            self.connection.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            # Already closed, or closing as we fire. Either way it is gone.
+            pass
+
+    def handle_one_request(self):
+        try:
+            super().handle_one_request()
+        except OSError:
+            # The shutdown above surfaces here as ConnectionAbortedError on
+            # Windows and ConnectionResetError elsewhere. socketserver would
+            # print the traceback through handle_error, which reads as a crash
+            # when it is this class doing exactly what it was asked to do.
+            self.close_connection = True
+
+    def finish(self):
+        expiry = getattr(self, "_expiry", None)
+        if expiry is not None:
+            expiry.cancel()
+        try:
+            super().finish()
+        except OSError:
+            # The shutdown above can land mid-response; the callback either
+            # arrived or it did not, and wait_for_callback decides which.
+            pass
 
     def do_GET(self):  # noqa: N802 (BaseHTTPRequestHandler API)
         parsed = urlparse(self.path)

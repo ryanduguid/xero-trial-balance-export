@@ -95,6 +95,21 @@ def flatten_report(report: dict) -> tuple[list[str], list[dict]]:
     return column_titles, flat
 
 
+# A balance of 1e30 is eighteen orders of magnitude past the largest company
+# on earth. The bound exists to keep arithmetic inside Decimal's context and
+# the CSV inside one line, not to police the ledger.
+MAX_EXPONENT = 30
+
+
+def _shown(text: str) -> str:
+    """The cell as the API sent it, safe for a terminal.
+
+    Escape sequences and newlines never reach it verbatim, same rule auth.py
+    applies to the OAuth error code.
+    """
+    return "".join(ch for ch in text[:40] if ch.isprintable())
+
+
 def to_number(value: str) -> Decimal:
     """Parse a report cell into an exact Decimal.
 
@@ -115,13 +130,26 @@ def to_number(value: str) -> Decimal:
     # Decimal("NaN") and Decimal("Infinity") parse, and a NaN compares
     # unequal to everything including itself, so it would reach the balance
     # check and the CSV as a number. Neither is an amount.
+    # Finite is not the same as usable. Decimal's default context stops at
+    # Emax 999999, so a cell of "1E1000000" parses and is finite, then the
+    # first total_debit += debit raises decimal.Overflow - an ArithmeticError,
+    # outside the CLI's handler tuple, so it printed a traceback after the
+    # tenant name had already gone to stdout. A shade under that, "1E999999"
+    # does not overflow but makes format_amount build a one-million-character
+    # CSV field. MAX_EXPONENT is eighteen orders of magnitude past the largest
+    # balance sheet on earth, so nothing real is refused here.
+    if amount is not None and amount.is_finite() and abs(amount.adjusted()) > MAX_EXPONENT:
+        raise SystemExit(
+            f'error: report cell "{_shown(text)}" is {amount.adjusted() + 1} digits '
+            "long, which is not a ledger balance. The API shape may have changed, "
+            "or this is not a trial balance report."
+        )
     if amount is None or not amount.is_finite():
         # The cell is whatever the API sent. Escape sequences and newlines
         # never reach the terminal verbatim, same rule auth.py applies to
         # the OAuth error code.
-        shown = "".join(ch for ch in text[:40] if ch.isprintable())
         raise SystemExit(
-            f'error: report cell "{shown}" is not an amount. The API shape '
+            f'error: report cell "{_shown(text)}" is not an amount. The API shape '
             "may have changed, or this is not a trial balance report."
         )
     return amount

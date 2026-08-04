@@ -78,11 +78,12 @@ def save_tokens(token_response: dict) -> None:
     """Persist a token endpoint response atomically, stamped with obtained_at.
 
     The temp file is deleted only when it holds nothing worth keeping. Once
-    the JSON is written and fsynced, that file is the only copy of the
+    the JSON has been written and flushed, that file is the only copy of the
     freshly issued refresh token: token.json still holds the previous one,
-    which Xero has already consumed. If the replace cannot be made to stick,
-    the temp file survives and its path goes into the error message, so the
-    pair can be recovered by hand inside Xero's 30-minute grace window.
+    which Xero has already consumed. If the fsync or the replace cannot be
+    made to stick, the temp file survives and its path goes into the error
+    message, so the pair can be recovered by hand inside Xero's 30-minute
+    grace window.
     """
     data = dict(token_response)
     data["obtained_at"] = time.time()
@@ -91,12 +92,26 @@ def save_tokens(token_response: dict) -> None:
     try:
         with os.fdopen(fd, "w") as fh:
             json.dump(data, fh, indent=2)
-            # Closing only reaches the OS page cache; NTFS journals the
+            fh.flush()
+            # The flush is what makes the file whole, which is all "written"
+            # claims. Past this line the temp file holds the complete new
+            # pair and is worth more than token.json, so the finally clause
+            # below must never delete it.
+            written = True
+            # Flushing only reaches the OS page cache; NTFS journals the
             # rename's metadata, not the data behind it. Force the bytes down
             # before os.replace destroys the previous token pair.
-            fh.flush()
-            os.fsync(fh.fileno())
-        written = True
+            try:
+                os.fsync(fh.fileno())
+            except OSError as exc:
+                raise SystemExit(
+                    f"error: wrote the new Xero token pair to {tmp_path} but "
+                    f"could not flush it to disk ({exc}). {TOKEN_FILE} still "
+                    f"holds the refresh token Xero has already consumed, so "
+                    f"leave it alone: copy {tmp_path} over {TOKEN_FILE} "
+                    "within Xero's 30-minute rotation grace window, or run: "
+                    "python auth.py"
+                ) from None
 
         last_error: OSError | None = None
         for attempt in range(REPLACE_ATTEMPTS):

@@ -97,6 +97,35 @@ class SaveTokensTest(unittest.TestCase):
         self.assertIn(tmp_path, message)
         self.assertNotIn("NEW", message)
 
+    def test_an_fsync_failure_keeps_the_new_token_on_disk(self):
+        """By the flush the temp file is whole, so it must outlive the fsync.
+
+        Deleting it here loses the only copy of the refresh token Xero just
+        issued, and leaves token.json holding the one Xero has consumed.
+        """
+        with open(self.token_file, "w") as fh:
+            json.dump({"refresh_token": "OLD-CONSUMED"}, fh)
+
+        err = OSError(5, "Input/output error")
+        with mock.patch.object(xero_client.os, "fsync", side_effect=err):
+            with self.assertRaises(SystemExit) as ctx:
+                xero_client.save_tokens({"refresh_token": "NEW"})
+
+        message = str(ctx.exception)
+        leftovers = self._temp_files()
+        self.assertEqual(
+            len(leftovers), 1, "the only copy of the new refresh token was deleted"
+        )
+        tmp_path = os.path.join(self.dir, leftovers[0])
+        with open(tmp_path) as fh:
+            self.assertEqual(json.load(fh)["refresh_token"], "NEW")
+        with open(self.token_file) as fh:
+            self.assertEqual(json.load(fh)["refresh_token"], "OLD-CONSUMED")
+        self.assertTrue(message.startswith("error: "), message)
+        self.assertIn(tmp_path, message)
+        self.assertIn("python auth.py", message)
+        self.assertNotIn("NEW", message)
+
     def test_a_half_written_temp_file_is_cleaned_up(self):
         with mock.patch.object(
             xero_client.json, "dump", side_effect=ValueError("boom")

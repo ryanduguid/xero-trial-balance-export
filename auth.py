@@ -43,6 +43,14 @@ ERROR_CODE = re.compile(r"[A-Za-z0-9_]{1,64}")
 # script serving forever.
 CALLBACK_TIMEOUT = 300
 
+# Read budget for one accepted connection. HTTPServer.timeout bounds accept()
+# only, so it does nothing for a connection that is accepted and then stays
+# silent: rfile.readline() blocks inside handle_request and the wall-clock
+# deadline never gets looked at again. Browsers open speculative connections
+# and abandon them, which is enough to trigger it. A redirect from the
+# browser on loopback arrives in one packet, so two seconds is generous.
+CALLBACK_READ_TIMEOUT = 2
+
 
 class _CallbackServer(HTTPServer):
     """Holds the callback port exclusively.
@@ -65,6 +73,34 @@ class _CallbackServer(HTTPServer):
         super().server_bind()
 
 
+def parse_redirect(redirect_uri: str):
+    """Split XERO_REDIRECT_URI into (hostname, port, path) or exit.
+
+    urlparse accepts anything and defers its complaints: .port returns None
+    when the URI carries no port and raises ValueError when the port is not
+    a number. None then reaches socket.bind() as a TypeError, which is not
+    an OSError and so escapes the bind handler as a raw traceback.
+    """
+    parsed = urlparse(redirect_uri)
+    try:
+        port = parsed.port
+    except ValueError:
+        port = None
+    if (
+        parsed.scheme not in ("http", "https")
+        or not parsed.hostname
+        or port is None
+        or not parsed.path.startswith("/")
+    ):
+        raise SystemExit(
+            f"error: XERO_REDIRECT_URI is set to '{redirect_uri}', which this "
+            "script cannot listen on. It needs a scheme, an explicit "
+            "host:port and a path, as in http://localhost:8400/callback. Use "
+            "the same URI here and on the app at developer.xero.com."
+        )
+    return parsed.hostname, port, parsed.path
+
+
 def wait_for_callback(server, timeout: float = CALLBACK_TIMEOUT) -> None:
     """Serve requests until the callback lands or the deadline passes."""
     deadline = time.monotonic() + timeout
@@ -79,7 +115,15 @@ def wait_for_callback(server, timeout: float = CALLBACK_TIMEOUT) -> None:
 
 
 class _CallbackHandler(BaseHTTPRequestHandler):
-    """Catches exactly one OAuth callback; ignores favicon and other noise."""
+    """Catches exactly one OAuth callback; ignores favicon and other noise.
+
+    timeout is read by StreamRequestHandler.setup, which applies it to the
+    accepted connection. Without it a peer that connects and sends nothing
+    parks handle_request in rfile.readline() for as long as it likes, and
+    wait_for_callback's deadline never comes around again.
+    """
+
+    timeout = CALLBACK_READ_TIMEOUT
 
     def do_GET(self):  # noqa: N802 (BaseHTTPRequestHandler API)
         parsed = urlparse(self.path)
@@ -111,7 +155,7 @@ def main() -> None:
     if not client_id or not client_secret:
         sys.exit("Set XERO_CLIENT_ID and XERO_CLIENT_SECRET in .env (see .env.example).")
 
-    parsed_redirect = urlparse(redirect_uri)
+    redirect_host, redirect_port, redirect_path = parse_redirect(redirect_uri)
     state = secrets.token_urlsafe(16)
 
     query = urlencode(
@@ -126,17 +170,15 @@ def main() -> None:
     url = f"{AUTHORIZE_URL}?{query}"
 
     try:
-        server = _CallbackServer(
-            (parsed_redirect.hostname, parsed_redirect.port), _CallbackHandler
-        )
+        server = _CallbackServer((redirect_host, redirect_port), _CallbackHandler)
     except OSError as exc:
         sys.exit(
-            f"error: cannot listen on {parsed_redirect.hostname}:"
-            f"{parsed_redirect.port} for the OAuth callback ({exc}). Something "
-            "else holds that port. Close it, or point XERO_REDIRECT_URI at a "
-            "free port and add the same URI to the app at developer.xero.com."
+            f"error: cannot listen on {redirect_host}:{redirect_port} for the "
+            f"OAuth callback ({exc}). Something else holds that port. Close "
+            "it, or point XERO_REDIRECT_URI at a free port and add the same "
+            "URI to the app at developer.xero.com."
         )
-    server.callback_path = parsed_redirect.path
+    server.callback_path = redirect_path
     server.auth_code = None
     server.auth_error = None
     server.returned_state = None

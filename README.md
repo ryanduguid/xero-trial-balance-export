@@ -57,6 +57,15 @@ Xero refresh tokens are **single-use**: every refresh returns a new refresh toke
 
 Read-only (`accounting.reports.trialbalance.read`, the granular scope new Xero apps require); this tool cannot write to any ledger. `token.json` and `.env` are gitignored — they are credentials, treat them like passwords. Both sit in the clone directory and inherit its Windows permissions, so keep the clone inside your own user profile; a clone under a shared path like `C:\Tools` hands the live refresh token and client secret to every local user. On a shared machine, strip the inherited access on the clone directory itself before scheduling anything — `icacls <clone-dir> /inheritance:r /grant:r <your-username>:(OI)(CI)F` — because every token refresh rewrites `token.json` as a new file that re-inherits the directory's permissions, so hardening the file alone lasts until the next run. MIT-licensed utility code, no warranty; outputs feed professional review like any other workpaper input. Not affiliated with or endorsed by Xero.
 
+## Tests
+
+With the dependencies installed, run the offline regression suite from the
+repository root:
+
+```bash
+python -B -m unittest discover -s tests -v
+```
+
 ## Related
 
 [`accounting-excel-toolkit`](https://github.com/ryanduguid/accounting-excel-toolkit) — Power Query parsers for the manual-export path, when API access isn't on the table.

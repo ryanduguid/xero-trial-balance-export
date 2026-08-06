@@ -12,9 +12,12 @@ that window and is locked out after it. Two defences here:
 """
 
 import json
+import math
 import os
 import tempfile
 import time
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 
 import requests
 
@@ -24,6 +27,28 @@ TOKEN_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "token.jso
 
 # Refresh this many seconds before the access token's stated expiry.
 EXPIRY_MARGIN = 60
+
+
+def retry_after_seconds(value: str | None, *, now: datetime | None = None) -> int:
+    """Turn an HTTP Retry-After value into a non-negative delay.
+
+    RFC 9110 permits either delay-seconds or an HTTP-date.  Xero normally
+    returns seconds, but treating a standards-compliant date as an integer
+    used to crash an otherwise recoverable 429 response.
+    """
+    if not value:
+        return 5
+    try:
+        return max(0, int(value))
+    except ValueError:
+        try:
+            retry_at = parsedate_to_datetime(value)
+        except (TypeError, ValueError, IndexError):
+            return 5
+        if retry_at.tzinfo is None:
+            retry_at = retry_at.replace(tzinfo=timezone.utc)
+        current = now or datetime.now(timezone.utc)
+        return max(0, math.ceil((retry_at - current).total_seconds()))
 
 
 def save_tokens(token_response: dict) -> None:
@@ -116,7 +141,7 @@ def api_get(
 
     resp = requests.get(url, headers=headers, params=params, timeout=30)
     if resp.status_code == 429:
-        wait = int(resp.headers.get("Retry-After", "5"))
+        wait = retry_after_seconds(resp.headers.get("Retry-After"))
         time.sleep(wait)
         resp = requests.get(url, headers=headers, params=params, timeout=30)
     if resp.status_code == 401:

@@ -37,6 +37,31 @@ SCOPES = "offline_access accounting.reports.trialbalance.read"
 ERROR_CODE = re.compile(r"[A-Za-z0-9_]{1,64}")
 
 
+def callback_server_config(redirect_uri: str) -> tuple[str, int, str]:
+    """Return the local HTTP listener configuration for a registered redirect.
+
+    ``http://localhost/callback`` is a valid URI and carries the default HTTP
+    port.  Passing its ``None`` port directly to HTTPServer raised a TypeError
+    before the browser could be opened.  This script deliberately implements a
+    plain local HTTP callback, so HTTPS redirect URIs need a different server
+    rather than a misleading listener that cannot complete TLS.
+    """
+    parsed = urlparse(redirect_uri)
+    if parsed.scheme != "http":
+        raise ValueError("XERO_REDIRECT_URI must use http for this local callback server")
+    if not parsed.hostname:
+        raise ValueError("XERO_REDIRECT_URI must include a host")
+    try:
+        port = parsed.port
+    except ValueError as exc:
+        raise ValueError("XERO_REDIRECT_URI has an invalid port") from exc
+    if port is None:
+        port = 80
+    if port <= 0:
+        raise ValueError("XERO_REDIRECT_URI port must be between 1 and 65535")
+    return parsed.hostname, port, parsed.path or "/"
+
+
 class _CallbackHandler(BaseHTTPRequestHandler):
     """Catches exactly one OAuth callback; ignores favicon and other noise."""
 
@@ -70,7 +95,10 @@ def main() -> None:
     if not client_id or not client_secret:
         sys.exit("Set XERO_CLIENT_ID and XERO_CLIENT_SECRET in .env (see .env.example).")
 
-    parsed_redirect = urlparse(redirect_uri)
+    try:
+        callback_host, callback_port, callback_path = callback_server_config(redirect_uri)
+    except ValueError as exc:
+        sys.exit(f"Invalid XERO_REDIRECT_URI: {exc}")
     state = secrets.token_urlsafe(16)
 
     query = urlencode(
@@ -84,8 +112,8 @@ def main() -> None:
     )
     url = f"{AUTHORIZE_URL}?{query}"
 
-    server = HTTPServer((parsed_redirect.hostname, parsed_redirect.port), _CallbackHandler)
-    server.callback_path = parsed_redirect.path
+    server = HTTPServer((callback_host, callback_port), _CallbackHandler)
+    server.callback_path = callback_path
     server.auth_code = None
     server.auth_error = None
     server.returned_state = None

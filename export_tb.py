@@ -121,6 +121,33 @@ def excel_safe(value: str) -> str:
     return "'" + value if str(value)[:1] in ("=", "+", "-", "@", "\t", "\r", "\n") else value
 
 
+def output_path(value: str | None, default_filename: str, *, root: str | None = None) -> str:
+    """Resolve a CSV output path beneath a controlled output root.
+
+    ``--out`` is intentionally useful for scheduled jobs, but it must not let
+    command-line input redirect a run to an arbitrary file. Normalize with
+    ``realpath`` before checking containment so both ``..`` components and
+    existing symlinked directories are unable to escape the working directory.
+    A caller that needs a different destination should set its process working
+    directory (for example, a Task Scheduler "Start in" value) deliberately.
+    """
+    output_root = os.path.realpath(root or os.getcwd())
+    requested = default_filename if value is None else value
+    candidate = os.path.realpath(os.path.join(output_root, requested))
+
+    if os.path.splitext(candidate)[1].lower() != ".csv":
+        raise ValueError("--out must name a .csv file")
+
+    # Keep the trailing separator: /exports-old must not be treated as a child
+    # of /exports. This is a prefix check only after realpath has normalized
+    # traversal and resolved existing links.
+    output_root_prefix = os.path.join(output_root, "")
+    if candidate.startswith(output_root_prefix):
+        return candidate
+
+    raise ValueError("--out must be a relative path beneath the current working directory")
+
+
 def main() -> None:
     # Non-console stdout on Windows is cp1252, not UTF-8 (PEP 528) — a macron
     # or CJK character in an org name must not abort a redirected or piped run
@@ -131,18 +158,31 @@ def main() -> None:
         except AttributeError:
             pass
 
+    parser = argparse.ArgumentParser(description="Export a Xero Trial Balance to CSV.")
+    parser.add_argument("--date", type=iso_date, default=date.today().isoformat(), help="Report date YYYY-MM-DD")
+    parser.add_argument("--tenant", default=None, help="Tenant name substring (required when multiple orgs are connected)")
+    parser.add_argument(
+        "--out",
+        default=None,
+        help="Output CSV path relative to the current working directory",
+    )
+    parser.add_argument("--payments-only", action="store_true", help="Cash-basis report")
+    args = parser.parse_args()
+
+    # Reject unsafe explicit destinations before looking up credentials or
+    # calling Xero. The default filename needs tenant metadata and is resolved
+    # later; for a supplied value the fallback is never used.
+    if args.out is not None:
+        try:
+            output_path(args.out, "unused.csv")
+        except ValueError as exc:
+            parser.error(str(exc))
+
     load_dotenv()
     client_id = os.environ.get("XERO_CLIENT_ID")
     client_secret = os.environ.get("XERO_CLIENT_SECRET")
     if not client_id or not client_secret:
         sys.exit("Set XERO_CLIENT_ID and XERO_CLIENT_SECRET in .env (see .env.example).")
-
-    parser = argparse.ArgumentParser(description="Export a Xero Trial Balance to CSV.")
-    parser.add_argument("--date", type=iso_date, default=date.today().isoformat(), help="Report date YYYY-MM-DD")
-    parser.add_argument("--tenant", default=None, help="Tenant name substring (required when multiple orgs are connected)")
-    parser.add_argument("--out", default=None, help="Output CSV path")
-    parser.add_argument("--payments-only", action="store_true", help="Cash-basis report")
-    args = parser.parse_args()
 
     # api_get looks the access token up fresh per call — no token is held
     # here, so a mid-run refresh can never leave a later call using the
@@ -195,7 +235,10 @@ def main() -> None:
     # {entity}-{report}-{period-end}-{basis}: matches the file convention in
     # the sibling repos, and keeps cash vs accrual runs from overwriting
     # each other
-    out_path = args.out or f"{safe_tenant}-tb-{args.date}-{basis}.csv"
+    try:
+        out_path = output_path(args.out, f"{safe_tenant}-tb-{args.date}-{basis}.csv")
+    except ValueError as exc:
+        parser.error(str(exc))
 
     fieldnames = [
         "ReportDate", "Tenant", "Section", "AccountID", "AccountName", "AccountCode",

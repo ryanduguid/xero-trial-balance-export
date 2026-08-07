@@ -51,6 +51,10 @@ def callback_server_config(redirect_uri: str) -> tuple[str, int, str]:
         raise ValueError("XERO_REDIRECT_URI must use http for this local callback server")
     if not parsed.hostname:
         raise ValueError("XERO_REDIRECT_URI must include a host")
+    if parsed.hostname != "localhost":
+        raise ValueError(
+            "XERO_REDIRECT_URI must use localhost for this local callback server"
+        )
     try:
         port = parsed.port
     except ValueError as exc:

@@ -16,7 +16,7 @@ See [`samples/sample-output.csv`](samples/sample-output.csv) for the exact outpu
 
 ## Setup (once, ~5 minutes)
 
-1. Create an app at [developer.xero.com](https://developer.xero.com/app/manage) → New app → Web app. Redirect URI: `http://localhost:8400/callback`
+1. Create an app at [developer.xero.com](https://developer.xero.com/app/manage) → New app → Web app. Redirect URI: `http://localhost:8400/callback`. This script intentionally accepts `localhost` only: it runs a local plain-HTTP callback and does not expose an OAuth listener to your LAN.
 2. `pip install -r requirements.txt` (Python 3.10 or newer)
 3. Copy `.env.example` to `.env`, fill in the app's client ID and secret
 4. `python auth.py` — browser opens, consent, done. Works with Xero's free Demo Company; no paid subscription needed.

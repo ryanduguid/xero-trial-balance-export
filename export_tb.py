@@ -25,7 +25,7 @@ import re
 import sys
 import tempfile
 from datetime import date
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal, InvalidOperation, localcontext
 
 from dotenv import load_dotenv
 
@@ -134,13 +134,22 @@ def to_number(value: str) -> Decimal:
     # tenant name had already gone to stdout. A shade under that, "1E999999"
     # does not overflow but makes format_amount build a one-million-character
     # CSV field. MAX_EXPONENT is eighteen orders of magnitude past the largest
-    # balance sheet on earth, so nothing real is refused here.
-    if amount is not None and amount.is_finite() and abs(amount.adjusted()) > MAX_EXPONENT:
-        raise SystemExit(
-            f'error: report cell "{_shown(text)}" is {amount.adjusted() + 1} digits '
-            "long, which is not a ledger balance. The API shape may have changed, "
-            "or this is not a trial balance report."
-        )
+    # balance sheet on earth, so nothing real is refused here. The mirror
+    # bound refuses vanishing exponents ("1E-31") for the same reason: no
+    # ledger holds them, and format_amount would build the same absurd field.
+    if amount is not None and amount.is_finite():
+        if amount.adjusted() > MAX_EXPONENT:
+            raise SystemExit(
+                f'error: report cell "{_shown(text)}" is {amount.adjusted() + 1} digits '
+                "long, which is not a ledger balance. The API shape may have changed, "
+                "or this is not a trial balance report."
+            )
+        if amount.adjusted() < -MAX_EXPONENT:
+            raise SystemExit(
+                f'error: report cell "{_shown(text)}" is smaller than any ledger '
+                "balance. The API shape may have changed, or this is not a trial "
+                "balance report."
+            )
     # Decimal("NaN") and Decimal("Infinity") parse, and a NaN compares
     # unequal to everything including itself, so it would reach the balance
     # check and the CSV as a number. Neither is an amount.
@@ -330,10 +339,18 @@ def main() -> None:
         credit = to_number(record.get("Credit"))
         ytd_debit = to_number(record.get("YTD Debit"))
         ytd_credit = to_number(record.get("YTD Credit"))
-        total_debit += debit
-        total_credit += credit
-        total_ytd_debit += ytd_debit
-        total_ytd_credit += ytd_credit
+        # Decimal construction is exact but arithmetic rounds at the context
+        # precision (28 by default). to_number admits cells up to 33
+        # significant digits (MAX_EXPONENT plus cents), so default-context
+        # totals could silently drop a final cent and pass a report that
+        # does not balance. 50 digits covers the admitted bound plus
+        # accumulation headroom.
+        with localcontext() as exact:
+            exact.prec = 50
+            total_debit += debit
+            total_credit += credit
+            total_ytd_debit += ytd_debit
+            total_ytd_credit += ytd_credit
 
         out_rows.append(
             {
@@ -363,7 +380,9 @@ def main() -> None:
         ("movement", total_debit, total_credit),
         ("YTD", total_ytd_debit, total_ytd_credit),
     ):
-        diff = debits - credits
+        with localcontext() as exact:
+            exact.prec = 50
+            diff = debits - credits
         if diff != 0:
             print(
                 f"WARNING: {label} debits {debits:,.2f} != credits "

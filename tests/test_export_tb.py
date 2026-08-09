@@ -214,6 +214,32 @@ class DecimalMoneyTest(_ExportCase):
         self.assertIn("diff 1.0", out)
         self.assertIsNone(data, "an unbalanced report must not reach disk")
 
+    def test_a_cent_at_the_admitted_magnitude_bound_still_unbalances(self):
+        # to_number admits up to 33 significant digits; Decimal arithmetic
+        # rounds at the context precision (28 by default), which would drop
+        # this cent from the totals and print Balance check OK. The totals
+        # run under a 50-digit local context so the cent survives.
+        raised, out, data = self.run_export(
+            [
+                ("Cash (090)", "1000000000000000000000000000000.01", "",
+                 "1000000000000000000000000000000.01", ""),
+                ("Equity (960)", "", "1000000000000000000000000000000.00",
+                 "", "1000000000000000000000000000000.00"),
+            ]
+        )
+        self.assertIsInstance(raised, SystemExit)
+        self.assertEqual(raised.code, 1)
+        self.assertIn("WARNING: movement debits", out)
+        self.assertIn("diff 0.01", out)
+        self.assertIsNone(data, "an unbalanced report must not reach disk")
+
+    def test_a_vanishing_exponent_is_refused_with_sensible_wording(self):
+        with self.assertRaises(SystemExit) as ctx:
+            export_tb.to_number("1E-31")
+        message = str(ctx.exception)
+        self.assertIn("smaller than any ledger balance", message)
+        self.assertNotIn("digits long", message)
+
     def test_an_exported_amount_keeps_the_digits_xero_sent(self):
         odd = "9007199254740993.00"  # 2**53 + 1, not representable as a float
         self.assertEqual(float(odd), 9007199254740992.0)

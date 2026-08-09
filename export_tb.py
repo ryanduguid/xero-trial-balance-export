@@ -25,6 +25,7 @@ import re
 import sys
 import tempfile
 from datetime import date
+from decimal import Decimal, InvalidOperation, localcontext
 
 from dotenv import load_dotenv
 
@@ -94,10 +95,85 @@ def flatten_report(report: dict) -> tuple[list[str], list[dict]]:
     return column_titles, flat
 
 
-def to_number(value: str) -> float:
-    if value is None or str(value).strip() == "":
-        return 0.0
-    return float(value)
+# A balance of 1e30 is eighteen orders of magnitude past the largest company
+# on earth. The bound exists to keep arithmetic inside Decimal's context and
+# the CSV inside one line, not to police the ledger.
+MAX_EXPONENT = 30
+
+
+def _shown(text: str) -> str:
+    """The cell as the API sent it, safe for a terminal.
+
+    Escape sequences and newlines never reach it verbatim, same rule auth.py
+    applies to the OAuth error code.
+    """
+    return "".join(ch for ch in text[:40] if ch.isprintable())
+
+
+def to_number(value: str) -> Decimal:
+    """Parse a report cell into an exact Decimal.
+
+    Money never goes through float here. float("0.1") + float("0.2") is not
+    0.3, and the error compounds across every row of a trial balance, so a
+    report that does not balance can total to zero and one that does can
+    total to something else. Decimal holds the digits Xero sent.
+    """
+    if value is None:
+        return Decimal("0")
+    text = str(value).strip()
+    if text == "":
+        return Decimal("0")
+    try:
+        amount = Decimal(text)
+    except InvalidOperation:
+        amount = None
+    # Finite is not the same as usable. Decimal's default context stops at
+    # Emax 999999, so a cell of "1E1000000" parses and is finite, then the
+    # first total_debit += debit raises decimal.Overflow - an ArithmeticError,
+    # outside the CLI's handler tuple, so it would print a traceback after the
+    # tenant name had already gone to stdout. A shade under that, "1E999999"
+    # does not overflow but makes format_amount build a one-million-character
+    # CSV field. MAX_EXPONENT is eighteen orders of magnitude past the largest
+    # balance sheet on earth, so nothing real is refused here. The mirror
+    # bound refuses vanishing exponents ("1E-31") for the same reason: no
+    # ledger holds them, and format_amount would build the same absurd field.
+    if amount is not None and amount.is_finite():
+        if amount.adjusted() > MAX_EXPONENT:
+            raise SystemExit(
+                f'error: report cell "{_shown(text)}" is {amount.adjusted() + 1} digits '
+                "long, which is not a ledger balance. The API shape may have changed, "
+                "or this is not a trial balance report."
+            )
+        if amount.adjusted() < -MAX_EXPONENT:
+            raise SystemExit(
+                f'error: report cell "{_shown(text)}" is smaller than any ledger '
+                "balance. The API shape may have changed, or this is not a trial "
+                "balance report."
+            )
+    # Decimal("NaN") and Decimal("Infinity") parse, and a NaN compares
+    # unequal to everything including itself, so it would reach the balance
+    # check and the CSV as a number. Neither is an amount.
+    if amount is None or not amount.is_finite():
+        raise SystemExit(
+            f'error: report cell "{_shown(text)}" is not an amount. The API shape '
+            "may have changed, or this is not a trial balance report."
+        )
+    return amount
+
+
+def format_amount(value: Decimal) -> str:
+    """Render an amount the way the CSV has always carried it.
+
+    Trailing zeros go, one decimal place always stays: 1200.00 -> "1200.0",
+    15234.50 -> "15234.5". That is what str() of the old float gave, so
+    existing downstream models keep parsing the same text. Note this is
+    formatting only; the arithmetic above it stays exact.
+    """
+    text = format(value, "f")  # never scientific notation
+    if "." not in text:
+        return text + ".0"
+    text = text.rstrip("0")
+    return text + "0" if text.endswith(".") else text
 
 
 def iso_date(value: str) -> str:
@@ -249,8 +325,8 @@ def main() -> None:
     # a scheduled Power BI refresh reads the path, not the exit code, so an
     # unbalanced export must never reach disk.
     out_rows = []
-    total_debit = total_credit = 0.0
-    total_ytd_debit = total_ytd_credit = 0.0
+    total_debit = total_credit = Decimal("0")
+    total_ytd_debit = total_ytd_credit = Decimal("0")
     for record in rows:
         account_raw = record.get("Account", "")
         match = ACCOUNT_PATTERN.match(account_raw)
@@ -263,10 +339,18 @@ def main() -> None:
         credit = to_number(record.get("Credit"))
         ytd_debit = to_number(record.get("YTD Debit"))
         ytd_credit = to_number(record.get("YTD Credit"))
-        total_debit += debit
-        total_credit += credit
-        total_ytd_debit += ytd_debit
-        total_ytd_credit += ytd_credit
+        # Decimal construction is exact but arithmetic rounds at the context
+        # precision (28 by default). to_number admits cells up to 33
+        # significant digits (MAX_EXPONENT plus cents), so default-context
+        # totals could silently drop a final cent and pass a report that
+        # does not balance. 50 digits covers the admitted bound plus
+        # accumulation headroom.
+        with localcontext() as exact:
+            exact.prec = 50
+            total_debit += debit
+            total_credit += credit
+            total_ytd_debit += ytd_debit
+            total_ytd_credit += ytd_credit
 
         out_rows.append(
             {
@@ -276,24 +360,34 @@ def main() -> None:
                 "AccountID": record.get("AccountID", ""),
                 "AccountName": excel_safe(name),
                 "AccountCode": excel_safe(code),
-                "Debit": debit,
-                "Credit": credit,
-                "YTDDebit": ytd_debit,
-                "YTDCredit": ytd_credit,
+                "Debit": format_amount(debit),
+                "Credit": format_amount(credit),
+                "YTDDebit": format_amount(ytd_debit),
+                "YTDCredit": format_amount(ytd_credit),
             }
         )
 
     # Both pairs must balance — the movement columns AND the YTD as-at
     # balances (the pair the README tells users to slice). Either one out
     # means the report is truncated or misparsed.
+    #
+    # The comparison is exact. The old round(diff, 2) existed to absorb float
+    # noise, and it also swallowed real differences under half a cent; with
+    # Decimal totals there is no noise to absorb, so any difference at all is
+    # a difference Xero did not send.
     unbalanced = False
     for label, debits, credits in (
         ("movement", total_debit, total_credit),
         ("YTD", total_ytd_debit, total_ytd_credit),
     ):
-        diff = round(debits - credits, 2)
+        with localcontext() as exact:
+            exact.prec = 50
+            diff = debits - credits
         if diff != 0:
-            print(f"WARNING: {label} debits {debits:,.2f} != credits {credits:,.2f} (diff {diff:,.2f})")
+            print(
+                f"WARNING: {label} debits {debits:,.2f} != credits "
+                f"{credits:,.2f} (diff {format_amount(diff)})"
+            )
             unbalanced = True
     if unbalanced:
         print("Nothing written — report likely truncated or misparsed.")

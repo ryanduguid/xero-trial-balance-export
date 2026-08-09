@@ -14,7 +14,10 @@ configure in the developer portal.
 import os
 import re
 import secrets
+import socket
 import sys
+import threading
+import time
 import webbrowser
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.parse import urlencode, urlparse, parse_qs
@@ -35,6 +38,26 @@ SCOPES = "offline_access accounting.reports.trialbalance.read"
 # whatever the browser was pointed at, so anything else — escape sequences,
 # newlines, a fake instruction — never reaches the terminal verbatim.
 ERROR_CODE = re.compile(r"[A-Za-z0-9_]{1,64}")
+
+# Wall-clock budget for the browser round trip. Without it a consent the
+# user never finishes, or one whose callback went somewhere else, leaves the
+# script serving forever.
+CALLBACK_TIMEOUT = 300
+
+# Read budget for one accepted connection. HTTPServer.timeout bounds accept()
+# only, so it does nothing for a connection that is accepted and then stays
+# silent: rfile.readline() blocks inside handle_request and the wall-clock
+# deadline never gets looked at again. Browsers open speculative connections
+# and abandon them, which is enough to trigger it. A redirect from the
+# browser on loopback arrives in one packet, so two seconds is generous.
+CALLBACK_READ_TIMEOUT = 2
+
+# Total budget for one accepted connection, whatever it does inside it. The
+# read timeout above resets on every byte received, so a peer sending one
+# byte per second holds the connection open indefinitely and wait_for_callback
+# never gets to re-test its own deadline. This one does not reset. A real
+# browser redirect is finished inside a few milliseconds.
+CALLBACK_CONNECTION_TIMEOUT = 10
 
 
 def callback_server_config(redirect_uri: str) -> tuple[str, int, str]:
@@ -66,8 +89,92 @@ def callback_server_config(redirect_uri: str) -> tuple[str, int, str]:
     return parsed.hostname, port, parsed.path or "/"
 
 
+class _CallbackServer(HTTPServer):
+    """Holds the callback port exclusively.
+
+    HTTPServer sets allow_reuse_address = 1. On Windows that means
+    SO_REUSEADDR, which lets bind() succeed on a port another process is
+    already listening on; whichever socket the OS picks then receives the
+    authorisation code, and it may not be this one. Refusing the port is the
+    only safe answer, so allow_reuse_address is off and, on Windows,
+    SO_EXCLUSIVEADDRUSE is set before the bind. A port already in use now
+    raises OSError up front.
+    """
+
+    allow_reuse_address = False
+
+    def server_bind(self):
+        exclusive = getattr(socket, "SO_EXCLUSIVEADDRUSE", None)
+        if os.name == "nt" and exclusive is not None:
+            self.socket.setsockopt(socket.SOL_SOCKET, exclusive, 1)
+        super().server_bind()
+
+
+def wait_for_callback(server, timeout: float = CALLBACK_TIMEOUT) -> None:
+    """Serve requests until the callback lands or the deadline passes."""
+    deadline = time.monotonic() + timeout
+    while server.auth_code is None and server.auth_error is None:
+        if time.monotonic() >= deadline:
+            raise SystemExit(
+                f"error: no Xero callback arrived within {int(timeout)} seconds. "
+                "Nothing was saved. Run again and complete the consent in the "
+                "browser."
+            )
+        server.handle_request()
+
+
 class _CallbackHandler(BaseHTTPRequestHandler):
-    """Catches exactly one OAuth callback; ignores favicon and other noise."""
+    """Catches exactly one OAuth callback; ignores favicon and other noise.
+
+    timeout is read by StreamRequestHandler.setup, which applies it to the
+    accepted connection. Without it a peer that connects and sends nothing
+    parks handle_request in rfile.readline() for as long as it likes, and
+    wait_for_callback's deadline never comes around again.
+
+    That bounds one recv, not the connection. A peer that dribbles one byte
+    every second resets the per-read timeout forever and holds handle_request
+    open past any wall-clock deadline: measured at 26s against a 300s
+    CALLBACK_TIMEOUT, it never returned. So the connection also gets a hard
+    deadline - a timer that shuts the socket down underneath any pending
+    read, which makes rfile.readline() return and hands control back to
+    wait_for_callback so it can re-test its own deadline.
+    """
+
+    timeout = CALLBACK_READ_TIMEOUT
+
+    def setup(self):
+        super().setup()
+        self._expiry = threading.Timer(CALLBACK_CONNECTION_TIMEOUT, self._expire)
+        self._expiry.daemon = True
+        self._expiry.start()
+
+    def _expire(self):
+        try:
+            self.connection.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            # Already closed, or closing as we fire. Either way it is gone.
+            pass
+
+    def handle_one_request(self):
+        try:
+            super().handle_one_request()
+        except OSError:
+            # The shutdown above surfaces here as ConnectionAbortedError on
+            # Windows and ConnectionResetError elsewhere. socketserver would
+            # print the traceback through handle_error, which reads as a crash
+            # when it is this class doing exactly what it was asked to do.
+            self.close_connection = True
+
+    def finish(self):
+        expiry = getattr(self, "_expiry", None)
+        if expiry is not None:
+            expiry.cancel()
+        try:
+            super().finish()
+        except OSError:
+            # The shutdown above can land mid-response; the callback either
+            # arrived or it did not, and wait_for_callback decides which.
+            pass
 
     def do_GET(self):  # noqa: N802 (BaseHTTPRequestHandler API)
         parsed = urlparse(self.path)
@@ -116,7 +223,15 @@ def main() -> None:
     )
     url = f"{AUTHORIZE_URL}?{query}"
 
-    server = HTTPServer((callback_host, callback_port), _CallbackHandler)
+    try:
+        server = _CallbackServer((callback_host, callback_port), _CallbackHandler)
+    except OSError as exc:
+        sys.exit(
+            f"error: cannot listen on {callback_host}:{callback_port} for the "
+            f"OAuth callback ({exc}). Something else holds that port. Close "
+            "it, or point XERO_REDIRECT_URI at a free port and add the same "
+            "URI to the app at developer.xero.com."
+        )
     server.callback_path = callback_path
     server.auth_code = None
     server.auth_error = None
@@ -130,8 +245,10 @@ def main() -> None:
         print("Could not open a browser (SSH or headless session?). Paste this URL into one:")
     print(f"  {url}")
 
-    while server.auth_code is None and server.auth_error is None:
-        server.handle_request()
+    try:
+        wait_for_callback(server)
+    finally:
+        server.server_close()
 
     # State first: neither the code nor the error is worth trusting until the
     # callback is proved to be the one this run started.

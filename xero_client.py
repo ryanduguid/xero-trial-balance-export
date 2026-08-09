@@ -15,9 +15,10 @@ that window and is locked out after it. Two defences here:
 import json
 import math
 import os
+import re
 import tempfile
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
 
 import requests
@@ -35,27 +36,62 @@ EXPIRY_MARGIN = 60
 REPLACE_ATTEMPTS = 5
 REPLACE_BACKOFF = 0.2
 
+# 429 backoff bounds. Xero's per-minute limit resets in under a minute, but
+# the daily limit answers with a Retry-After measured in hours. Sleeping on
+# that pins a scheduled export for the rest of the day, so cap the wait and
+# exit instead.
+RETRY_AFTER_DEFAULT = 5
+RETRY_AFTER_MAX = 60
+
+# Upper bound on the parsed value. The cap message turns it into a reset
+# timestamp, and timedelta(seconds=...) overflows on a large enough number:
+# 10**12 raises "date value out of range" and 10**13 raises "Python int too
+# large to convert to C int", both as tracebacks. A day is longer than any
+# Xero limit window, so anything above it is server junk either way.
+RETRY_AFTER_CLAMP = 86400
+
+# RFC 9110 delta-seconds is 1*DIGIT and nothing else. int() is wider than
+# that grammar: it takes underscores ("1_0" -> 10), a leading sign ("+7" ->
+# 7) and Unicode digits, so a header the spec does not allow would set a
+# wait the docstring promises to refuse.
+DELTA_SECONDS = re.compile(r"[0-9]+")
+
 
 def retry_after_seconds(value: str | None, *, now: datetime | None = None) -> int:
     """Turn an HTTP Retry-After value into a non-negative delay.
 
-    RFC 9110 permits either delay-seconds or an HTTP-date.  Xero normally
-    returns seconds, but treating a standards-compliant date as an integer
-    used to crash an otherwise recoverable 429 response.
+    RFC 9110 permits either delta-seconds or an HTTP-date. Xero normally
+    returns seconds, but an HTTP-date is standards-compliant and used to
+    crash an otherwise recoverable 429 response, so both forms parse here.
+    Delta-seconds is held to the RFC's own grammar (digits only); a missing
+    header, a signed or underscored number or any other junk lands on
+    RETRY_AFTER_DEFAULT rather than raising - the header is server-supplied
+    and must never be able to crash the retry.
+
+    Whichever branch parses it, the result is clamped to RETRY_AFTER_CLAMP,
+    so every caller can do arithmetic on it without an overflow check of
+    its own.
     """
-    if not value:
-        return 5
+    if value is None:
+        return RETRY_AFTER_DEFAULT
+    text = str(value).strip()
+    if DELTA_SECONDS.fullmatch(text):
+        # int() refuses a string of more than 4300 digits (CPython's
+        # conversion limit) by raising ValueError, so count digits before
+        # converting. More digits than the clamp has means the value is
+        # above it whatever it is.
+        digits = text.lstrip("0") or "0"
+        if len(digits) > len(str(RETRY_AFTER_CLAMP)):
+            return RETRY_AFTER_CLAMP
+        return min(int(digits), RETRY_AFTER_CLAMP)
     try:
-        return max(0, int(value))
-    except ValueError:
-        try:
-            retry_at = parsedate_to_datetime(value)
-        except (TypeError, ValueError, IndexError):
-            return 5
-        if retry_at.tzinfo is None:
-            retry_at = retry_at.replace(tzinfo=timezone.utc)
-        current = now or datetime.now(timezone.utc)
-        return max(0, math.ceil((retry_at - current).total_seconds()))
+        retry_at = parsedate_to_datetime(text)
+    except (TypeError, ValueError, IndexError):
+        return RETRY_AFTER_DEFAULT
+    if retry_at.tzinfo is None:
+        retry_at = retry_at.replace(tzinfo=timezone.utc)
+    current = now or datetime.now(timezone.utc)
+    return min(max(0, math.ceil((retry_at - current).total_seconds())), RETRY_AFTER_CLAMP)
 
 
 def save_tokens(token_response: dict) -> None:
@@ -173,7 +209,11 @@ def api_get(
     tenant_id: str | None = None,
     params: dict | None = None,
 ) -> dict:
-    """GET a Xero API URL with auth headers. One polite retry on 429.
+    """GET a Xero API URL with auth headers. One capped retry on 429.
+
+    The 429 wait comes from a server-supplied Retry-After, so it is parsed
+    defensively and capped: a daily-limit response asking for hours exits
+    with the reset time instead of holding the process.
 
     The access token is looked up via get_access_token() per call, never
     passed in — a token captured once by a caller goes stale the moment any
@@ -193,9 +233,32 @@ def api_get(
 
     resp = requests.get(url, headers=headers, params=params, timeout=30)
     if resp.status_code == 429:
-        wait = retry_after_seconds(resp.headers.get("Retry-After"))
+        raw_retry_after = resp.headers.get("Retry-After")
+        wait = retry_after_seconds(raw_retry_after)
+        if wait > RETRY_AFTER_MAX:
+            # wait is clamped by retry_after_seconds, so this addition cannot
+            # overflow however large the header was.
+            reset_at = datetime.now().astimezone() + timedelta(seconds=wait)
+            # The header as sent, not the clamped number: reporting the clamp
+            # as the server's own figure told anyone debugging the header a
+            # value Xero never sent. Truncated and stripped of non-printables
+            # because it is remote input on its way to a terminal.
+            asked = "".join(ch for ch in str(raw_retry_after)[:40] if ch.isprintable())
+            raise SystemExit(
+                f"error: Xero rate limit hit and sent Retry-After: {asked}, "
+                f"over the {RETRY_AFTER_MAX}s cap this script will sleep for. "
+                f"The limit resets at or after "
+                f"{reset_at.isoformat(timespec='seconds')} - re-run after that "
+                f"(computed from the clamped {wait}s wait; the real reset may "
+                f"be later)."
+            )
         time.sleep(wait)
         resp = requests.get(url, headers=headers, params=params, timeout=30)
+        if resp.status_code == 429:
+            raise SystemExit(
+                f"error: Xero is still rate limiting after a {wait}s wait - "
+                "re-run later."
+            )
     if resp.status_code == 401:
         headers["Authorization"] = f"Bearer {get_access_token(*credentials, force=True)}"
         resp = requests.get(url, headers=headers, params=params, timeout=30)

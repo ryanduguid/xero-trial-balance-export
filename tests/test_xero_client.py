@@ -27,6 +27,7 @@ class _Response:
 class RetryAfterTests(unittest.TestCase):
     def test_accepts_delay_seconds(self):
         self.assertEqual(xero_client.retry_after_seconds("7"), 7)
+        self.assertEqual(xero_client.retry_after_seconds(" 17 "), 17)
 
     def test_accepts_an_http_date_and_rounds_up(self):
         now = datetime(2030, 1, 1, 0, 0, 0, 500000, tzinfo=timezone.utc)
@@ -35,9 +36,53 @@ class RetryAfterTests(unittest.TestCase):
         self.assertEqual(xero_client.retry_after_seconds(value, now=now), 2)
 
     def test_malformed_or_missing_values_fall_back_to_a_politeness_delay(self):
-        self.assertEqual(xero_client.retry_after_seconds(None), 5)
-        self.assertEqual(xero_client.retry_after_seconds("not-a-date"), 5)
-        self.assertEqual(xero_client.retry_after_seconds("-1"), 0)
+        for raw in (None, "", "not-a-date", "soon", "1.5", "-1"):
+            with self.subTest(raw=raw):
+                self.assertEqual(
+                    xero_client.retry_after_seconds(raw),
+                    xero_client.RETRY_AFTER_DEFAULT,
+                )
+
+    def test_values_outside_the_delta_seconds_grammar_are_refused(self):
+        """int() accepts syntax RFC 9110 delta-seconds does not."""
+        # The escape below is ARABIC-INDIC DIGIT THREE, which int() reads as 3.
+        for raw in ("1_0", "+7", "\u0663", "7 7", "0x10"):
+            with self.subTest(raw=raw):
+                self.assertEqual(
+                    xero_client.retry_after_seconds(raw),
+                    xero_client.RETRY_AFTER_DEFAULT,
+                )
+
+    def test_an_enormous_value_is_clamped(self):
+        self.assertEqual(
+            xero_client.retry_after_seconds("1000000000000"),
+            xero_client.RETRY_AFTER_CLAMP,
+        )
+        self.assertEqual(
+            xero_client.retry_after_seconds("10" * 400),
+            xero_client.RETRY_AFTER_CLAMP,
+        )
+
+    def test_a_value_past_the_int_conversion_limit_is_clamped(self):
+        """int() raises ValueError above 4300 digits, which nothing catches."""
+        self.assertEqual(
+            xero_client.retry_after_seconds("9" * 5000),
+            xero_client.RETRY_AFTER_CLAMP,
+        )
+
+    def test_leading_zeros_do_not_look_like_a_huge_value(self):
+        self.assertEqual(xero_client.retry_after_seconds("0000000017"), 17)
+        self.assertEqual(xero_client.retry_after_seconds("000"), 0)
+
+    def test_a_far_future_http_date_is_clamped_too(self):
+        """The synthesis point: main's HTTP-date branch feeds the same clamp."""
+        now = datetime(2030, 1, 1, tzinfo=timezone.utc)
+        retry_at = now + timedelta(days=400)
+        value = format_datetime(retry_at, usegmt=True)
+        self.assertEqual(
+            xero_client.retry_after_seconds(value, now=now),
+            xero_client.RETRY_AFTER_CLAMP,
+        )
 
     def test_api_get_retries_a_429_with_an_http_date(self):
         responses = iter(
@@ -55,6 +100,148 @@ class RetryAfterTests(unittest.TestCase):
 
         self.assertEqual(get.call_count, 2)
         sleep.assert_called_once_with(0)
+
+
+class ApiGet429Test(unittest.TestCase):
+    def setUp(self):
+        patcher = mock.patch.object(
+            xero_client, "get_access_token", return_value="tok"
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_junk_header_sleeps_the_default_and_retries(self):
+        responses = [
+            _Response(429, headers={"Retry-After": "who knows"}),
+            _Response(200, payload={"ok": True}),
+        ]
+        with mock.patch.object(
+            xero_client.requests, "get", side_effect=responses
+        ) as get, mock.patch.object(xero_client.time, "sleep") as sleep:
+            result = xero_client.api_get("https://example.test", ("id", "secret"))
+
+        self.assertEqual(result, {"ok": True})
+        sleep.assert_called_once_with(xero_client.RETRY_AFTER_DEFAULT)
+        self.assertEqual(get.call_count, 2)
+
+    def test_a_wait_over_the_cap_exits_without_sleeping(self):
+        over = xero_client.RETRY_AFTER_MAX + 1
+        with mock.patch.object(
+            xero_client.requests,
+            "get",
+            return_value=_Response(429, headers={"Retry-After": str(over)}),
+        ), mock.patch.object(xero_client.time, "sleep") as sleep:
+            with self.assertRaises(SystemExit) as ctx:
+                xero_client.api_get("https://example.test", ("id", "secret"))
+
+        message = str(ctx.exception)
+        sleep.assert_not_called()
+        self.assertTrue(message.startswith("error: "), message)
+        self.assertIn(str(over), message)
+        self.assertIn("resets at", message)
+
+    def test_an_http_date_past_the_cap_exits_too(self):
+        """The synthesis point: main's HTTP-date parse feeds the same cap."""
+        retry_at = datetime.now(timezone.utc) + timedelta(hours=2)
+        value = format_datetime(retry_at, usegmt=True)
+        with mock.patch.object(
+            xero_client.requests,
+            "get",
+            return_value=_Response(429, headers={"Retry-After": value}),
+        ), mock.patch.object(xero_client.time, "sleep") as sleep:
+            with self.assertRaises(SystemExit) as ctx:
+                xero_client.api_get("https://example.test", ("id", "secret"))
+
+        message = str(ctx.exception)
+        sleep.assert_not_called()
+        self.assertTrue(message.startswith("error: "), message)
+        self.assertIn("resets at", message)
+        self.assertIn("GMT", message)  # the header itself is quoted back
+
+    def test_an_enormous_retry_after_exits_instead_of_overflowing(self):
+        """The cap message does date arithmetic on the parsed wait.
+
+        Unclamped, timedelta(seconds=10**12) raises OverflowError as a
+        traceback, which is the opposite of the clean exit the cap promises.
+        """
+        with mock.patch.object(
+            xero_client.requests,
+            "get",
+            return_value=_Response(429, headers={"Retry-After": "1000000000000"}),
+        ), mock.patch.object(xero_client.time, "sleep") as sleep:
+            with self.assertRaises(SystemExit) as ctx:
+                xero_client.api_get("https://example.test", ("id", "secret"))
+
+        message = str(ctx.exception)
+        sleep.assert_not_called()
+        self.assertTrue(message.startswith("error: "), message)
+        self.assertIn("resets at", message)
+
+    def test_a_second_429_exits_instead_of_raising_for_status(self):
+        responses = [
+            _Response(429, headers={"Retry-After": "5"}),
+            _Response(429, headers={"Retry-After": "5"}),
+        ]
+        with mock.patch.object(
+            xero_client.requests, "get", side_effect=responses
+        ), mock.patch.object(xero_client.time, "sleep"):
+            with self.assertRaises(SystemExit) as ctx:
+                xero_client.api_get("https://example.test", ("id", "secret"))
+        self.assertTrue(str(ctx.exception).startswith("error: "), str(ctx.exception))
+
+
+class RetryAfterMessageTruthTest(unittest.TestCase):
+    """The cap message must report the header, not the clamp.
+
+    retry_after_seconds clamps, and a message that then printed the clamped
+    number as the value the server asked for would tell anyone debugging the
+    header a figure Xero never sent.
+    """
+
+    def setUp(self):
+        patcher = mock.patch.object(
+            xero_client, "get_access_token", return_value="tok"
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def _exit_message(self, header):
+        with mock.patch.object(
+            xero_client.requests,
+            "get",
+            return_value=_Response(429, headers={"Retry-After": header}),
+        ), mock.patch.object(xero_client.time, "sleep") as sleep:
+            with self.assertRaises(SystemExit) as ctx:
+                xero_client.api_get("https://example.test", ("id", "secret"))
+        sleep.assert_not_called()
+        return str(ctx.exception)
+
+    def test_the_header_the_server_sent_is_quoted_back(self):
+        message = self._exit_message("1000000000000")
+        self.assertIn("1000000000000", message)
+        self.assertIn(f"{xero_client.RETRY_AFTER_MAX}s cap", message)
+
+    def test_the_clamp_is_named_as_a_clamp_not_as_the_reset(self):
+        message = self._exit_message("1000000000000")
+        self.assertIn("clamp", message)
+        self.assertIn("may", message)
+
+    def test_a_hostile_header_never_gets_as_far_as_the_message(self):
+        """retry_after_seconds refuses anything outside the grammar and
+        returns the default, so a header carrying escape sequences takes the
+        retry path instead of the cap message. The strip in that message is
+        defence in depth for a future grammar change, not a live path - said
+        here so the next reader does not take it for a proven one."""
+        responses = [
+            _Response(429, headers={"Retry-After": "999999\x1b[2J\nWARNING: fake"}),
+            _Response(200, payload={"ok": True}),
+        ]
+        with mock.patch.object(
+            xero_client.requests, "get", side_effect=responses
+        ), mock.patch.object(xero_client.time, "sleep") as sleep:
+            result = xero_client.api_get("https://example.test", ("id", "secret"))
+        self.assertEqual(result, {"ok": True})
+        sleep.assert_called_once_with(xero_client.RETRY_AFTER_DEFAULT)
 
 
 class SaveTokensTest(unittest.TestCase):

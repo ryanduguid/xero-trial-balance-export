@@ -8,7 +8,8 @@ that window and is locked out after it. Two defences here:
 1. Tokens are written to disk immediately after every refresh response,
    before any API call is made with the new access token.
 2. The write is atomic (temp file + os.replace), so a crash mid-write can't
-   leave a corrupt token.json.
+   leave a corrupt token.json. If the replace itself cannot be completed,
+   the temp file holding the new pair is kept and named in the error.
 """
 
 import json
@@ -27,6 +28,12 @@ TOKEN_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "token.jso
 
 # Refresh this many seconds before the access token's stated expiry.
 EXPIRY_MARGIN = 60
+
+# os.replace onto token.json fails on Windows while any other process holds
+# the destination open, and the README tells users a second concurrent run is
+# possible. Ride out a brief lock rather than losing the new refresh token.
+REPLACE_ATTEMPTS = 5
+REPLACE_BACKOFF = 0.2
 
 
 def retry_after_seconds(value: str | None, *, now: datetime | None = None) -> int:
@@ -52,21 +59,66 @@ def retry_after_seconds(value: str | None, *, now: datetime | None = None) -> in
 
 
 def save_tokens(token_response: dict) -> None:
-    """Persist a token endpoint response atomically, stamped with obtained_at."""
+    """Persist a token endpoint response atomically, stamped with obtained_at.
+
+    The temp file is deleted only when it holds nothing worth keeping. Once
+    the JSON has been written and flushed, that file is the only copy of the
+    freshly issued refresh token: token.json still holds the previous one,
+    which Xero has already consumed. If the fsync or the replace cannot be
+    made to stick, the temp file survives and its path goes into the error
+    message, so the pair can be recovered by hand inside Xero's 30-minute
+    grace window.
+    """
     data = dict(token_response)
     data["obtained_at"] = time.time()
     fd, tmp_path = tempfile.mkstemp(dir=os.path.dirname(TOKEN_FILE), suffix=".tmp")
+    written = False
     try:
         with os.fdopen(fd, "w") as fh:
             json.dump(data, fh, indent=2)
-            # Closing only reaches the OS page cache; NTFS journals the
+            fh.flush()
+            # The flush is what makes the file whole, which is all "written"
+            # claims. Past this line the temp file holds the complete new
+            # pair and is worth more than token.json, so the finally clause
+            # below must never delete it.
+            written = True
+            # Flushing only reaches the OS page cache; NTFS journals the
             # rename's metadata, not the data behind it. Force the bytes down
             # before os.replace destroys the previous token pair.
-            fh.flush()
-            os.fsync(fh.fileno())
-        os.replace(tmp_path, TOKEN_FILE)
+            try:
+                os.fsync(fh.fileno())
+            except OSError as exc:
+                raise SystemExit(
+                    f"error: wrote the new Xero token pair to {tmp_path} but "
+                    f"could not flush it to disk ({exc}). {TOKEN_FILE} still "
+                    f"holds the refresh token Xero has already consumed, so "
+                    f"leave it alone: copy {tmp_path} over {TOKEN_FILE} "
+                    "within Xero's 30-minute rotation grace window, or run: "
+                    "python auth.py"
+                ) from None
+
+        last_error: OSError | None = None
+        for attempt in range(REPLACE_ATTEMPTS):
+            try:
+                os.replace(tmp_path, TOKEN_FILE)
+                return
+            except OSError as exc:
+                last_error = exc
+                if attempt < REPLACE_ATTEMPTS - 1:
+                    time.sleep(REPLACE_BACKOFF * (attempt + 1))
+
+        raise SystemExit(
+            f"error: wrote the new Xero token pair to {tmp_path} but could not "
+            f"move it onto {TOKEN_FILE} after {REPLACE_ATTEMPTS} attempts "
+            f"({last_error}). {TOKEN_FILE} still holds the refresh token Xero "
+            f"has already consumed, so leave it alone: copy {tmp_path} over "
+            f"{TOKEN_FILE} within Xero's 30-minute rotation grace window, or "
+            "run: python auth.py"
+        )
     finally:
-        if os.path.exists(tmp_path):
+        # A half-written temp file is worthless; a fully written one is the
+        # only copy of the new refresh token and must survive.
+        if not written and os.path.exists(tmp_path):
             os.unlink(tmp_path)
 
 

@@ -57,34 +57,54 @@ def flatten_report(report: dict) -> tuple[list[str], list[dict]]:
     Section (Title + nested Rows), or Row/SummaryRow. Cell order follows the
     Header titles. SummaryRow (section totals) is skipped — totals are
     recomputed, not trusted.
+
+    Every nested list is checked before it is walked. main() proves the
+    Reports envelope is a list of objects, and the strict zip below proves a
+    row's cell count; without these checks everything between those two was
+    unguarded, so a Rows, Cells or Attributes value that was a string, a
+    mapping or a list of strings called .get() on a str and printed a raw
+    AttributeError traceback — after the tenant name had gone to stdout and
+    the single-use refresh token behind the report call had been spent.
     """
     column_titles: list[str] = []
     flat: list[dict] = []
 
-    def cell_values(row: dict) -> list[str]:
-        return [c.get("Value", "") for c in row.get("Cells", [])]
+    def object_list(container: dict, key: str, where: str) -> list[dict]:
+        """The nested list of objects the report format promises, or an exit."""
+        value = container.get(key, [])
+        if not isinstance(value, list) or not all(isinstance(item, dict) for item in value):
+            raise SystemExit(
+                f"error: report {where} has a {key} value that is not a list "
+                "of objects. The API shape may have changed, or this is not a "
+                "trial balance report."
+            )
+        return value
 
-    def account_id(row: dict) -> str:
+    def cell_values(row: dict, where: str) -> list[str]:
+        return [c.get("Value", "") for c in object_list(row, "Cells", where)]
+
+    def account_id(row: dict, where: str) -> str:
         # Every data cell carries Attributes: [{"Value": "<account guid>",
         # "Id": "account"}] — the stable join key; codes and names change.
-        cells = row.get("Cells", [])
+        cells = object_list(row, "Cells", where)
         if not cells:
             return ""
-        for attr in cells[0].get("Attributes", []):
+        for attr in object_list(cells[0], "Attributes", where):
             if attr.get("Id") == "account":
                 return attr.get("Value", "")
         return ""
 
-    for top in report.get("Rows", []):
+    for top in object_list(report, "Rows", "top level"):
         row_type = top.get("RowType")
         if row_type == "Header":
-            column_titles = cell_values(top)
+            column_titles = cell_values(top, "top level")
         elif row_type == "Section":
             section = top.get("Title", "")
-            for row in top.get("Rows", []):
+            where = f'section "{_shown(section)}"'
+            for row in object_list(top, "Rows", where):
                 if row.get("RowType") != "Row":
                     continue  # skip SummaryRow
-                values = cell_values(row)
+                values = cell_values(row, where)
                 record = {}
                 # strict: a row/header length mismatch means the API shape
                 # changed — fail loudly instead of exporting silent zeros.
@@ -103,7 +123,7 @@ def flatten_report(report: dict) -> tuple[list[str], list[dict]]:
                     ) from None
                 # synthetic keys set last so they win any header collision
                 record["Section"] = section
-                record["AccountID"] = account_id(row)
+                record["AccountID"] = account_id(row, where)
                 flat.append(record)
 
     return column_titles, flat
@@ -115,13 +135,18 @@ def flatten_report(report: dict) -> tuple[list[str], list[dict]]:
 MAX_EXPONENT = 30
 
 
-def _shown(text: str) -> str:
+def _shown(text: object) -> str:
     """The cell as the API sent it, safe for a terminal.
 
     Escape sequences and newlines never reach it verbatim, same rule auth.py
     applies to the OAuth error code.
+
+    Takes object, not str, and coerces: this runs on values straight off the
+    API, and every caller is either building an error message or labelling
+    one. A non-string Title used to crash here with a raw traceback, which is
+    the failure mode the callers exist to prevent.
     """
-    return "".join(ch for ch in text[:40] if ch.isprintable())
+    return "".join(ch for ch in str(text)[:40] if ch.isprintable())
 
 
 def to_number(value: str) -> Decimal:
@@ -505,12 +530,30 @@ def main() -> None:
             writer.writeheader()
             writer.writerows(out_rows)
             fh.flush()
-            os.fsync(fh.fileno())
-            # Past this line the temp file holds the complete, balance-checked
-            # export and the API call that produced it cannot be replayed for
-            # free. It is worth more than the stale CSV at out_path, so the
-            # finally clause below must never delete it.
+            # The flush is what makes the file whole, which is all "written"
+            # claims - the same line save_tokens draws. Past it the temp file
+            # holds the complete, balance-checked export and the API call that
+            # produced it cannot be replayed for free. It is worth more than
+            # the stale CSV at out_path, so the finally clause below must
+            # never delete it.
             written = True
+            # Flushing only reaches the OS page cache; NTFS journals the
+            # rename's metadata, not the data behind it. Force the bytes down
+            # before os.replace destroys the previous export. A failure here
+            # is a disk that would not take the write, not a half-built file:
+            # setting written above and exiting with the temp path named keeps
+            # the export recoverable instead of unlinking it and printing a
+            # bare OSError traceback, which run() does not catch.
+            try:
+                os.fsync(fh.fileno())
+            except OSError as exc:
+                raise SystemExit(
+                    f"error: wrote the balanced export to {tmp_path} but could "
+                    f"not flush it to disk ({exc}). The file is complete and "
+                    f"balance-checked: rename {tmp_path} over {out_path} once "
+                    "the disk is writable - the report has been fetched "
+                    "already and re-running spends another refresh token."
+                ) from None
     finally:
         if not written and os.path.exists(tmp_path):
             os.unlink(tmp_path)

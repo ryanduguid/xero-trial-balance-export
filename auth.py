@@ -25,7 +25,7 @@ from urllib.parse import urlencode, urlparse, parse_qs
 import requests
 from dotenv import load_dotenv
 
-from xero_client import save_tokens, validate_token_response
+from xero_client import save_tokens, validate_rotated_response
 
 AUTHORIZE_URL = "https://login.xero.com/identity/connect/authorize"
 TOKEN_URL = "https://identity.xero.com/connect/token"
@@ -275,7 +275,13 @@ def main() -> None:
         tokens = resp.json()
     except ValueError:
         sys.exit("error: Xero returned a non-JSON token response. Nothing was saved.")
-    validate_token_response(tokens, label="Xero token response")
+    # The authorisation code behind this response is single-use and was just
+    # spent, so the pair in hand is the only thing standing between the user
+    # and another round of browser consent. validate_rotated_response keeps
+    # the pair whatever expires_in says (it is a local cache hint, and the
+    # access token works regardless) and still refuses a response carrying no
+    # usable access_token or refresh_token, where there is nothing to save.
+    tokens = validate_rotated_response(tokens)
     save_tokens(tokens)
     print("Tokens saved to token.json. Next: python export_tb.py --date 2026-06-30")
 

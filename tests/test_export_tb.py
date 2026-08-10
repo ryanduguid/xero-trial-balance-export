@@ -238,6 +238,46 @@ class ConnectionValidationTest(unittest.TestCase):
             with self.subTest(payload=payload), self.assertRaises(SystemExit):
                 export_tb.validated_connections(payload)
 
+    def test_main_puts_the_connections_response_through_the_validator(self):
+        """The function above is only worth testing if main() calls it.
+
+        Without the call, a tenantName carrying a newline reaches stdout, the
+        Tenant column of the CSV and the default filename; the test above
+        passes either way, so it is the wiring that has to be pinned. The
+        report call must not happen at all - it costs this run's single-use
+        refresh token.
+        """
+        env = {"XERO_CLIENT_ID": "id-not-a-secret", "XERO_CLIENT_SECRET": "secret-not-used"}
+        for payload, expected in (
+            ([{"tenantId": "id", "tenantName": "Injected\nWARNING: fake"}], "tenantName"),
+            ([{"tenantId": "id\x1b[2J", "tenantName": "Sample"}], "tenantId"),
+            ([{"tenantId": "id"}], "tenantName"),
+            (["not-an-object"], "is not an object"),
+            ({"tenantId": "id", "tenantName": "Sample"}, "is not a list"),
+        ):
+            with self.subTest(payload=payload):
+                work_dir = tempfile.mkdtemp()
+                argv = ["export_tb.py", "--date", "2026-06-30", "--out", "tb.csv"]
+                previous_dir = os.getcwd()
+                os.chdir(work_dir)
+                try:
+                    with mock.patch.object(export_tb, "load_dotenv", lambda *a, **k: None), \
+                            mock.patch.object(export_tb, "get_connections", return_value=payload), \
+                            mock.patch.object(export_tb, "api_get") as api_get, \
+                            mock.patch.dict(os.environ, env, clear=False), \
+                            mock.patch.object(sys, "argv", argv):
+                        with redirect_stdout(io.StringIO()) as out:
+                            with self.assertRaises(SystemExit) as ctx:
+                                export_tb.main()
+                finally:
+                    os.chdir(previous_dir)
+                message = str(ctx.exception)
+                self.assertTrue(message.startswith("error: "), message)
+                self.assertIn(expected, message)
+                self.assertNotIn("WARNING: fake", out.getvalue())
+                api_get.assert_not_called()
+                self.assertEqual(os.listdir(work_dir), [])
+
 
 class DecimalMoneyTest(_ExportCase):
     """The money path must be exact, not float.
@@ -597,6 +637,59 @@ class OutputReplaceLockTest(_ExportCase):
         self.assertIn(b"ReportDate,Tenant,Section", recovered)
 
 
+class OutputFsyncFailureTest(_ExportCase):
+    """By the flush the temp file is whole, so it must outlive the fsync.
+
+    This is save_tokens' rule applied to the export: deleting the temp file
+    here throws away a finished, balance-checked report whose API call cannot
+    be replayed for free, and an uncaught OSError out of os.fsync is a bare
+    traceback in a scheduled task's log - run() catches transport failures
+    only. The sibling guard is
+    test_xero_client.SaveTokensTest.test_an_fsync_failure_keeps_the_new_token_on_disk.
+    """
+
+    BALANCED = [
+        ("Cash (090)", "100.00", "", "100.00", ""),
+        ("Equity (960)", "", "100.00", "", "100.00"),
+    ]
+
+    def test_an_fsync_failure_keeps_the_finished_export_and_names_it(self):
+        err = OSError(5, "Input/output error")
+        with mock.patch.object(export_tb.os, "fsync", side_effect=err):
+            raised, _, data = self.run_export(self.BALANCED)
+
+        self.assertIsInstance(
+            raised, SystemExit, "the OSError reached the operator as a traceback"
+        )
+        message = str(raised.code)
+        self.assertTrue(message.startswith("error: "), message)
+        self.assertIn("Input/output error", message)
+        self.assertIsNone(data, "os.replace never ran, so nothing is at --out")
+
+        leftovers = [f for f in os.listdir(self.work_dir) if f.endswith(".tmp")]
+        self.assertEqual(
+            len(leftovers), 1, "the completed export was deleted, not kept"
+        )
+        tmp_path = os.path.join(self.work_dir, leftovers[0])
+        self.assertIn(tmp_path, message)
+        with open(tmp_path, "rb") as fh:
+            recovered = fh.read()
+        self.assertIn(b"Cash", recovered)
+        self.assertIn(b"ReportDate,Tenant,Section", recovered)
+
+    def test_a_half_written_export_is_still_cleaned_up(self):
+        """The other side of the same flag: nothing is whole before the flush,
+        so a failure there must still leave no temp file behind."""
+        with mock.patch.object(
+            export_tb.csv.DictWriter, "writerows", side_effect=ValueError("boom")
+        ):
+            with self.assertRaises(ValueError):
+                self.run_export(self.BALANCED)
+        self.assertEqual(
+            [f for f in os.listdir(self.work_dir) if f.endswith(".tmp")], []
+        )
+
+
 class FlattenReportShapeTest(unittest.TestCase):
     """A cell-count change and a missing Header row both hit the strict zip.
     Neither is a bug in this script, so neither should print a traceback."""
@@ -615,6 +708,32 @@ class FlattenReportShapeTest(unittest.TestCase):
             }
         )
         return {"Rows": rows}
+
+    def test_a_non_string_section_title_does_not_crash_the_export(self):
+        """The section label is built for every Section, before any error.
+
+        _shown() slices its argument, so a Title the API sent as null or a
+        number used to raise a raw TypeError here - after the tenant name had
+        reached stdout and this run's single-use refresh token was spent, and
+        with the balanced report thrown away. A label is not worth a run.
+        """
+        for title in (None, 7, True, {"nested": 1}, ["a"]):
+            with self.subTest(title=title):
+                titles, flat = export_tb.flatten_report(
+                    self._payload(["Cash (090)", "1200.00", "", "1200.00", ""], title=title)
+                )
+                self.assertEqual(titles, HEADER)
+                self.assertEqual(flat[0]["Account"], "Cash (090)")
+                self.assertEqual(flat[0]["Section"], title)
+
+    def test_a_non_string_section_title_is_still_shown_in_a_shape_error(self):
+        with self.assertRaises(SystemExit) as ctx:
+            export_tb.flatten_report(
+                self._payload(["Cash (090)", "1200.00", "", "extra"], title=None)
+            )
+        message = str(ctx.exception)
+        self.assertTrue(message.startswith("error: "), message)
+        self.assertIn("None", message)
 
     def test_a_matching_row_still_flattens(self):
         titles, flat = export_tb.flatten_report(
@@ -679,6 +798,74 @@ class FlattenReportShapeTest(unittest.TestCase):
         }
         _, flat = export_tb.flatten_report(payload)
         self.assertEqual(flat[0]["AccountID"], "the-account-guid")
+
+    def test_every_nested_list_must_hold_objects(self):
+        """main() proves the Reports envelope is a list of objects and the
+        strict zip proves a row's cell count; everything between them was
+        unguarded, so a Rows, Cells or Attributes value that was a string, a
+        mapping or a list of strings called .get() on a str and printed a raw
+        AttributeError - after the tenant name had gone to stdout and the
+        single-use refresh token behind the report call had been spent."""
+        section = {"RowType": "Section", "Title": "Assets", "Rows": []}
+        row = {"RowType": "Row", "Cells": [{"Value": "Cash (090)"}]}
+        for payload, key in (
+            ({"Rows": "junk"}, "Rows"),
+            ({"Rows": {"Rows": []}}, "Rows"),
+            ({"Rows": ["Assets"]}, "Rows"),
+            ({"Rows": [{"RowType": "Header", "Cells": "junk"}]}, "Cells"),
+            ({"Rows": [{"RowType": "Header", "Cells": ["Account"]}]}, "Cells"),
+            ({"Rows": [dict(section, Rows="junk")]}, "Rows"),
+            ({"Rows": [dict(section, Rows=["Cash (090)"])]}, "Rows"),
+            ({"Rows": [dict(section, Rows=[dict(row, Cells="junk")])]}, "Cells"),
+            ({"Rows": [dict(section, Rows=[dict(row, Cells=["Cash"])])]}, "Cells"),
+            (
+                {
+                    "Rows": [
+                        {"RowType": "Header", "Cells": [{"Value": "Account"}]},
+                        dict(
+                            section,
+                            Rows=[
+                                {
+                                    "RowType": "Row",
+                                    "Cells": [
+                                        {"Value": "Cash (090)", "Attributes": "junk"}
+                                    ],
+                                }
+                            ],
+                        ),
+                    ]
+                },
+                "Attributes",
+            ),
+        ):
+            with self.subTest(payload=payload):
+                with self.assertRaises(SystemExit) as ctx:
+                    export_tb.flatten_report(payload)
+                message = str(ctx.exception)
+                self.assertTrue(message.startswith("error: "), message)
+                self.assertIn(f"{key} value that is not a list of objects", message)
+
+    def test_the_shape_message_names_the_section_and_strips_it(self):
+        with self.assertRaises(SystemExit) as ctx:
+            export_tb.flatten_report(
+                {
+                    "Rows": [
+                        {
+                            "RowType": "Section",
+                            "Title": "\x1b[2JAssets\nWARNING: fake",
+                            "Rows": "junk",
+                        }
+                    ]
+                }
+            )
+        message = str(ctx.exception)
+        self.assertIn("Assets", message)
+        self.assertNotIn("\x1b", message)
+        self.assertNotIn("\n", message)
+
+    def test_a_report_with_no_rows_key_is_still_empty_rather_than_an_error(self):
+        self.assertEqual(export_tb.flatten_report({}), ([], []))
+        self.assertEqual(export_tb.flatten_report({"Rows": []}), ([], []))
 
     def test_the_section_title_is_stripped_before_it_reaches_the_terminal(self):
         with self.assertRaises(SystemExit) as ctx:

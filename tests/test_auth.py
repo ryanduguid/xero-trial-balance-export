@@ -4,10 +4,11 @@ import socket
 import threading
 import time
 import unittest
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from unittest import mock
 
 import auth
+import xero_client
 from auth import callback_server_config
 
 
@@ -342,6 +343,114 @@ class StateCheckTest(unittest.TestCase):
         post.assert_called_once()
         self.assertEqual(post.call_args.kwargs["data"]["code"], "the-code")
         save_tokens.assert_called_once_with(self.TOKENS)
+
+
+class ExchangeResponseTest(unittest.TestCase):
+    """The code exchange holds an un-replayable pair, exactly like a refresh.
+
+    The authorisation code behind this response is single-use, so refusing
+    the response costs the whole browser consent round trip. expires_in is a
+    local cache hint the client can do without, and xero_client already has
+    the rule for that case - validate_rotated_response substitutes the
+    30-minute default and keeps the pair. Applying the strict validator here
+    instead threw a freshly issued refresh token away over the hint. The
+    sibling guard on the refresh path is SaveTokensTest's
+    test_refresh_with_an_unusable_expires_in_still_persists_the_rotated_pair,
+    and the ('1800', 0, None, True, 999999) set below is the one it uses.
+    """
+
+    GENERATED = "state-this-run-generated"
+
+    def _run_main(self, payload, *, json_error=False):
+        port = _free_port()
+        env = {
+            "XERO_CLIENT_ID": "id-not-a-secret",
+            "XERO_CLIENT_SECRET": "secret-not-used",
+            "XERO_REDIRECT_URI": f"http://localhost:{port}/callback",
+        }
+
+        def land_the_callback(server, timeout=auth.CALLBACK_TIMEOUT):
+            server.auth_code = "the-code"
+            server.auth_error = None
+            server.returned_state = self.GENERATED
+
+        class _Response(_StubTokenResponse):
+            def json(self):
+                if json_error:
+                    raise ValueError("Expecting value: line 1 column 1 (char 0)")
+                return payload
+
+        raised = None
+        stderr = io.StringIO()
+        with mock.patch.object(auth, "load_dotenv", lambda *a, **k: None), \
+                mock.patch.dict(os.environ, env, clear=False), \
+                mock.patch.object(auth.secrets, "token_urlsafe", return_value=self.GENERATED), \
+                mock.patch.object(auth.webbrowser, "open", return_value=False), \
+                mock.patch.object(auth, "wait_for_callback", side_effect=land_the_callback), \
+                mock.patch.object(auth.requests, "post", return_value=_Response(payload)), \
+                mock.patch.object(auth, "save_tokens") as save_tokens:
+            with redirect_stdout(io.StringIO()), redirect_stderr(stderr):
+                try:
+                    auth.main()
+                except SystemExit as exc:
+                    raised = exc
+        return raised, save_tokens, stderr.getvalue()
+
+    def test_an_unusable_expires_in_still_persists_the_issued_pair(self):
+        for hint in ("1800", 0, None, True, 999999, 1800.0):
+            with self.subTest(expires_in=hint):
+                payload = {"access_token": "A", "refresh_token": "R", "expires_in": hint}
+                raised, save_tokens, stderr = self._run_main(payload)
+                self.assertIsNone(raised, raised)
+                save_tokens.assert_called_once()
+                saved = save_tokens.call_args.args[0]
+                self.assertEqual(saved["access_token"], "A")
+                self.assertEqual(saved["refresh_token"], "R")
+                self.assertEqual(saved["expires_in"], xero_client.DEFAULT_EXPIRES_IN)
+                self.assertIn("unusable expires_in", stderr)
+
+    def test_a_missing_expires_in_is_defaulted_rather_than_refused(self):
+        raised, save_tokens, _ = self._run_main({"access_token": "A", "refresh_token": "R"})
+        self.assertIsNone(raised, raised)
+        self.assertEqual(
+            save_tokens.call_args.args[0]["expires_in"], xero_client.DEFAULT_EXPIRES_IN
+        )
+
+    def test_a_usable_expires_in_is_kept_exactly_as_sent(self):
+        raised, save_tokens, stderr = self._run_main(
+            {"access_token": "A", "refresh_token": "R", "expires_in": 1800}
+        )
+        self.assertIsNone(raised, raised)
+        save_tokens.assert_called_once_with(
+            {"access_token": "A", "refresh_token": "R", "expires_in": 1800}
+        )
+        self.assertEqual(stderr, "")
+
+    def test_a_response_with_no_usable_pair_saves_nothing(self):
+        """There is nothing worth persisting without both tokens, so this
+        half of the validator stays fatal."""
+        for payload in (
+            {"refresh_token": "R", "expires_in": 1800},
+            {"access_token": "A", "expires_in": 1800},
+            {"access_token": "", "refresh_token": "R", "expires_in": 1800},
+            {"access_token": "A", "refresh_token": "   ", "expires_in": 1800},
+            {"access_token": "A", "refresh_token": ["R"], "expires_in": 1800},
+            ["access_token", "refresh_token"],
+        ):
+            with self.subTest(payload=payload):
+                raised, save_tokens, _ = self._run_main(payload)
+                self.assertIsInstance(raised, SystemExit)
+                message = str(raised.code)
+                self.assertTrue(message.startswith("error: "), message)
+                self.assertIn("no token was saved", message)
+                save_tokens.assert_not_called()
+
+    def test_a_non_json_token_response_saves_nothing(self):
+        raised, save_tokens, _ = self._run_main({}, json_error=True)
+        self.assertIsInstance(raised, SystemExit)
+        self.assertIn("non-JSON token response", str(raised.code))
+        self.assertIn("Nothing was saved", str(raised.code))
+        save_tokens.assert_not_called()
 
 
 if __name__ == "__main__":

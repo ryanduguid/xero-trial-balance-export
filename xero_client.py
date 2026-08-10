@@ -88,14 +88,21 @@ def _require_token_pair(payload: object, *, label: str) -> dict:
 
 
 def validate_rotated_response(payload: object) -> dict:
-    """Validate a refresh response without ever discarding the rotated pair.
+    """Validate a token endpoint response without discarding the pair in it.
 
-    By the time this response arrives the previous refresh token is already
-    spent, so the pair in hand is the only way back in without a full
-    re-authorisation. access_token and refresh_token must be present — there
-    is nothing worth persisting without them. expires_in is a local cache
-    hint only, so an unusable one is replaced with the conservative default
-    instead of throwing a perfectly good refresh token away.
+    Both callers are here for the same reason. By the time a refresh response
+    arrives the previous refresh token is already spent; by the time a code
+    exchange response arrives (auth.py) the single-use authorisation code is
+    already spent. Either way the pair in hand is the only way forward short
+    of a full browser re-authorisation. access_token and refresh_token must
+    be present — there is nothing worth persisting without them. expires_in
+    is a local cache hint only, so an unusable one is replaced with the
+    conservative default instead of throwing a perfectly good refresh token
+    away.
+
+    validate_token_response is the strict sibling and stays that way: it
+    guards the token.json read, where refusing a corrupt payload stops the
+    run without destroying anything - the file is left exactly as it was.
     """
     label = "Xero token response"
     tokens = dict(_require_token_pair(payload, label=label))
@@ -111,7 +118,17 @@ def validate_rotated_response(payload: object) -> dict:
 
 
 def validate_token_response(payload: object, *, label: str, cached: bool = False) -> dict:
-    """Fail before a malformed token response can replace a usable cache."""
+    """Fail on a token payload nothing is lost by refusing.
+
+    This is the strict half of the pair: an unusable expires_in is fatal
+    here. Its caller is the token.json read, where the payload is a local
+    cache file rather than a freshly issued pair - a corrupt or hand-edited
+    expires_in there is a reason to stop and re-authorise, and refusing it
+    destroys nothing, because token.json is left exactly as it was. A
+    response carrying a newly issued, un-replayable pair goes through
+    validate_rotated_response instead, which never throws that pair away over
+    a cache hint.
+    """
     _require_token_pair(payload, label=label)
     if not _expires_in_is_usable(payload.get("expires_in")):
         raise SystemExit(f"error: {label} has an invalid expires_in; no token was saved.")

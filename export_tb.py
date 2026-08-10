@@ -197,6 +197,22 @@ def excel_safe(value: str) -> str:
     return "'" + value if str(value)[:1] in ("=", "+", "-", "@", "\t", "\r", "\n") else value
 
 
+def validated_connections(value: object) -> list[dict]:
+    """Validate the remote tenant list before it reaches paths, CSV, or output."""
+    if not isinstance(value, list):
+        raise SystemExit("error: Xero connections response is not a list.")
+    result = []
+    for index, item in enumerate(value, start=1):
+        if not isinstance(item, dict):
+            raise SystemExit(f"error: Xero connection {index} is not an object.")
+        for field in ("tenantId", "tenantName"):
+            text = item.get(field)
+            if not isinstance(text, str) or not text.strip() or any(ord(char) < 32 or ord(char) == 127 for char in text):
+                raise SystemExit(f"error: Xero connection {index} has an invalid {field}.")
+        result.append(item)
+    return result
+
+
 def output_path(value: str | None, default_filename: str, *, root: str | None = None) -> str:
     """Resolve a CSV output path beneath a controlled output root.
 
@@ -265,7 +281,7 @@ def main() -> None:
     # stale one; the creds also cover the surprise-401 forced refresh
     creds = (client_id, client_secret)
 
-    connections = get_connections(creds)
+    connections = validated_connections(get_connections(creds))
     if not connections:
         sys.exit("No Xero organisations authorised for this app — run auth.py again.")
     if args.tenant:
@@ -289,9 +305,13 @@ def main() -> None:
         params["paymentsOnly"] = "true"
 
     payload = api_get(REPORT_URL, creds, tenant_id=tenant["tenantId"], params=params)
+    if not isinstance(payload, dict):
+        sys.exit("error: Xero Trial Balance response is not a JSON object.")
     reports = payload.get("Reports", [])
     if not reports:
         sys.exit("Empty Reports payload — check the date parameter and API scopes.")
+    if not isinstance(reports, list) or not isinstance(reports[0], dict):
+        sys.exit("error: Xero Trial Balance response has an unexpected Reports shape.")
 
     column_titles, rows = flatten_report(reports[0])
     if not rows:

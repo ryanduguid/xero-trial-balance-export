@@ -178,6 +178,47 @@ class CsvOutputTest(_ExportCase):
         self.assertEqual(data, expected)
 
 
+class ReportShapeTest(unittest.TestCase):
+    def test_a_malformed_reports_value_exits_cleanly_instead_of_raising(self):
+        connections = [{"tenantId": "tenant-guid", "tenantName": "Sample Trading Pty Ltd"}]
+        env = {"XERO_CLIENT_ID": "id-not-a-secret", "XERO_CLIENT_SECRET": "secret-not-used"}
+        for payload in (
+            {"Reports": {"Rows": []}},
+            {"Reports": "TrialBalance"},
+            {"Reports": ["TrialBalance"]},
+            {"Reports": [["Rows"]]},
+        ):
+            with self.subTest(payload=payload):
+                work_dir = tempfile.mkdtemp()
+                argv = ["export_tb.py", "--date", "2026-06-30", "--out", "tb.csv"]
+                previous_dir = os.getcwd()
+                os.chdir(work_dir)
+                try:
+                    with mock.patch.object(export_tb, "load_dotenv", lambda *a, **k: None), \
+                            mock.patch.object(export_tb, "get_connections", return_value=connections), \
+                            mock.patch.object(export_tb, "api_get", return_value=payload), \
+                            mock.patch.dict(os.environ, env, clear=False), \
+                            mock.patch.object(sys, "argv", argv):
+                        with redirect_stdout(io.StringIO()):
+                            with self.assertRaises(SystemExit) as caught:
+                                export_tb.main()
+                finally:
+                    os.chdir(previous_dir)
+                self.assertIn("Reports shape", str(caught.exception))
+
+
+class ConnectionValidationTest(unittest.TestCase):
+    def test_remote_connection_metadata_must_be_safe_and_complete(self):
+        for payload in (
+            {"tenantId": "id", "tenantName": "name"},
+            ["not-an-object"],
+            [{"tenantId": "id"}],
+            [{"tenantId": "id", "tenantName": "Injected\nWARNING"}],
+        ):
+            with self.subTest(payload=payload), self.assertRaises(SystemExit):
+                export_tb.validated_connections(payload)
+
+
 class DecimalMoneyTest(_ExportCase):
     """The money path must be exact, not float.
 

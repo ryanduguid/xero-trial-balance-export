@@ -25,7 +25,7 @@ from urllib.parse import urlencode, urlparse, parse_qs
 import requests
 from dotenv import load_dotenv
 
-from xero_client import save_tokens
+from xero_client import save_tokens, validate_token_response
 
 AUTHORIZE_URL = "https://login.xero.com/identity/connect/authorize"
 TOKEN_URL = "https://identity.xero.com/connect/token"
@@ -271,7 +271,12 @@ def main() -> None:
         timeout=30,
     )
     resp.raise_for_status()
-    save_tokens(resp.json())
+    try:
+        tokens = resp.json()
+    except ValueError:
+        sys.exit("error: Xero returned a non-JSON token response. Nothing was saved.")
+    validate_token_response(tokens, label="Xero token response")
+    save_tokens(tokens)
     print("Tokens saved to token.json. Next: python export_tb.py --date 2026-06-30")
 
 

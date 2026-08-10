@@ -25,6 +25,19 @@ class _Response:
             raise RuntimeError(f"unexpected HTTP {self.status_code}")
 
 
+class _NonJsonResponse(_Response):
+    """A 200 whose body is not JSON.
+
+    What a captive portal, a proxy sign-in page or an HTML maintenance page
+    looks like from here: the status says success and resp.json() raises
+    ValueError. requests raises its own JSONDecodeError, which subclasses
+    ValueError, so this stands in for it without importing the private class.
+    """
+
+    def json(self):
+        raise ValueError("Expecting value: line 1 column 1 (char 0)")
+
+
 class RetryAfterTests(unittest.TestCase):
     def test_accepts_delay_seconds(self):
         self.assertEqual(xero_client.retry_after_seconds("7"), 7)
@@ -62,6 +75,17 @@ class RetryAfterTests(unittest.TestCase):
         self.assertEqual(
             xero_client.retry_after_seconds("10" * 400),
             xero_client.RETRY_AFTER_CLAMP,
+        )
+
+    def test_a_value_just_over_the_clamp_is_clamped_too(self):
+        """The digit-count preflight only refuses more digits than the clamp
+        has, so everything from 86401 to 99999 reaches the min() - which is
+        the only thing holding those values down."""
+        self.assertEqual(
+            xero_client.retry_after_seconds("86401"), xero_client.RETRY_AFTER_CLAMP
+        )
+        self.assertEqual(
+            xero_client.retry_after_seconds("99999"), xero_client.RETRY_AFTER_CLAMP
         )
 
     def test_a_value_past_the_int_conversion_limit_is_clamped(self):
@@ -530,6 +554,34 @@ class RefreshRejectionTest(unittest.TestCase):
         self.assertIn("XERO_CLIENT_SECRET", message)
         self.assertIn(".env", message)
         self.assertNotIn("OLD-R", message)
+
+    def test_a_non_json_refresh_response_leaves_the_cache_untouched(self):
+        """A 200 that is not JSON is a captive portal or a proxy page, not a
+        rotation. resp.json() raises ValueError, which nothing above this
+        catches, so it used to be a traceback - and the refresh token in
+        token.json is still the one to use, because Xero never issued a new
+        pair. The _refresh helper proves the file is byte-identical after."""
+        message = self._refresh(_NonJsonResponse(200))
+        self.assertTrue(message.startswith("error: "), message)
+        self.assertIn("non-JSON token response", message)
+        self.assertIn("left untouched", message)
+
+
+class ApiGetNonJsonTest(unittest.TestCase):
+    """The report call's own copy of the same guard. api_get returns straight
+    into export_tb's flattener, so an HTML body has to stop here rather than
+    reach it as a ValueError traceback."""
+
+    def test_a_non_json_api_response_exits_with_one_line(self):
+        with mock.patch.object(xero_client, "get_access_token", return_value="tok"), \
+                mock.patch.object(
+                    xero_client.requests, "get", return_value=_NonJsonResponse(200)
+                ):
+            with self.assertRaises(SystemExit) as ctx:
+                xero_client.api_get("https://example.invalid", ("id", "secret"))
+        message = str(ctx.exception)
+        self.assertTrue(message.startswith("error: "), message)
+        self.assertIn("non-JSON API response", message)
 
 
 if __name__ == "__main__":

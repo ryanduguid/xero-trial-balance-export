@@ -253,12 +253,12 @@ def main() -> None:
     # State first: neither the code nor the error is worth trusting until the
     # callback is proved to be the one this run started.
     if server.returned_state != state:
-        sys.exit("State mismatch — possible CSRF or stale callback. Run again.")
+        sys.exit("State mismatch - possible CSRF or stale callback. Run again.")
 
     if server.auth_error:
         if ERROR_CODE.fullmatch(server.auth_error):
-            sys.exit(f"Xero returned '{server.auth_error}' — consent was denied or cancelled. Run again.")
-        sys.exit("Xero returned an error code this script could not read — consent was denied or cancelled. Run again.")
+            sys.exit(f"Xero returned '{server.auth_error}' - consent was denied or cancelled. Run again.")
+        sys.exit("Xero returned an error code this script could not read - consent was denied or cancelled. Run again.")
 
     resp = requests.post(
         TOKEN_URL,

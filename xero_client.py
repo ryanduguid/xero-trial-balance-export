@@ -245,13 +245,13 @@ def save_tokens(token_response: dict) -> None:
 
 def load_tokens() -> dict:
     if not os.path.exists(TOKEN_FILE):
-        raise SystemExit("No token.json — run: python auth.py")
+        raise SystemExit("No token.json - run: python auth.py")
     with open(TOKEN_FILE) as fh:
         try:
             return json.load(fh)
         except (json.JSONDecodeError, UnicodeDecodeError):
             raise SystemExit(
-                "token.json is unreadable or corrupt — delete it and "
+                "token.json is unreadable or corrupt - delete it and "
                 "run: python auth.py"
             ) from None
 

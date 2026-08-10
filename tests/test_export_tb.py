@@ -114,6 +114,9 @@ def _report(accounts, section="Assets", header=HEADER):
     return {"Reports": [{"Rows": rows}]}
 
 
+_UNSET = object()  # "no payload override", so None stays a testable payload
+
+
 class _ExportCase(unittest.TestCase):
     """Runs export_tb.main() against a stubbed Xero.
 
@@ -132,17 +135,22 @@ class _ExportCase(unittest.TestCase):
         tenant_id="tenant-guid",
         section="Assets",
         header=HEADER,
+        payload=_UNSET,
     ):
         """Return (SystemExit or None, stdout, csv bytes or None).
 
         out=None omits --out entirely, which is the path that resolves the
         default filename; the scratch directory is left on self.work_dir so a
         caller can inspect a filename it did not choose.
+
+        payload= replaces the whole stubbed Xero response, for the guards that
+        fire before a report can be built out of accounts at all.
         """
         work_dir = tempfile.mkdtemp()
         self.work_dir = work_dir
         out_path = None if out is None else os.path.join(work_dir, out)
-        payload = _report(accounts, section=section, header=header)
+        if payload is _UNSET:
+            payload = _report(accounts, section=section, header=header)
         argv = ["export_tb.py", "--date", date]
         if out is not None:
             argv += ["--out", out]
@@ -379,6 +387,28 @@ class BalanceCheckTest(_ExportCase):
         self.assertNotIn("WARNING: movement debits", out)
         self.assertIsNone(data, "an unbalanced YTD pair must not reach disk")
 
+    def test_a_difference_under_half_a_cent_is_still_a_difference(self):
+        """The comparison is exact, and only an exact one can say so.
+
+        The old round(diff, 2) existed to absorb float noise. The totals are
+        Decimal now, so there is no noise to absorb and the rounding only
+        swallowed real differences: a tenth of a cent out is a report Xero
+        did not send, and under the rounded comparison it was written to the
+        path a refresh reads with "Balance check OK" printed over it.
+        """
+        raised, out, data = self.run_export(
+            [
+                ("Cash (090)", "100.001", "", "100.001", ""),
+                ("Equity (960)", "", "100.000", "", "100.000"),
+            ]
+        )
+        self.assertIsInstance(raised, SystemExit)
+        self.assertEqual(raised.code, 1)
+        self.assertIn("WARNING: movement debits", out)
+        self.assertIn("diff 0.001", out)
+        self.assertNotIn("Balance check OK", out)
+        self.assertIsNone(data, "a sub-cent difference reached disk")
+
     def test_a_balanced_ytd_does_not_excuse_an_unbalanced_movement(self):
         raised, out, data = self.run_export(
             [
@@ -432,9 +462,11 @@ class ExcelInjectionExportTest(_ExportCase):
 
 
 class DefaultFilenameTest(unittest.TestCase):
-    """The sanitiser keeps ASCII letters and digits only, so it can collapse
-    two different orgs onto one filename and let the second export overwrite
-    the first client's numbers."""
+    """The sanitiser drops everything outside ASCII, folds ASCII punctuation
+    onto "-" and folds case, so it can collapse two different orgs onto one
+    filename and let the second export overwrite the first client's numbers.
+    The tenant ID is the only per-org value in the name, so every default
+    filename carries it."""
 
     ID = "abcdef12-3456-7890-1234-567890abcdef"
 
@@ -492,14 +524,36 @@ class DefaultFilenameTest(unittest.TestCase):
             "pty-ltd-aa-bb-cc-tb-2026-06-30-accrual.csv",
         )
 
-    def test_an_all_ascii_org_name_keeps_the_documented_filename(self):
+    def test_names_differing_only_in_ascii_punctuation_or_case_still_split(self):
+        """The collision does not need a character outside ASCII either.
+
+        Parentheses, an ampersand, a slash and an uppercase letter all end up
+        as the same "-" or the same lowercase letter, so the earlier
+        non-ASCII-only rule left every pair below sharing one filename - the
+        exact harm the rule was written to stop, one class of character
+        further along.
+        """
+        for first_name, second_name, stem in (
+            ("Acme (Holdings) Pty Ltd", "Acme Holdings Pty Ltd", "acme-holdings-pty-ltd"),
+            ("Smith & Co Pty Ltd", "Smith Co Pty Ltd", "smith-co-pty-ltd"),
+            ("Jones/Brown Trust", "Jones Brown Trust", "jones-brown-trust"),
+            ("ACME Pty Ltd", "Acme Pty Ltd", "acme-pty-ltd"),
+        ):
+            with self.subTest(names=(first_name, second_name)):
+                first = self._name(first_name, "11111111-aaaa")
+                second = self._name(second_name, "22222222-bbbb")
+                self.assertEqual(first, f"{stem}-11111111-tb-2026-06-30-accrual.csv")
+                self.assertEqual(second, f"{stem}-22222222-tb-2026-06-30-accrual.csv")
+                self.assertNotEqual(first, second)
+
+    def test_an_all_ascii_org_name_carries_the_tenant_id_too(self):
         self.assertEqual(
             self._name("Demo Company (AU)"),
-            "demo-company-au-tb-2026-06-30-accrual.csv",
+            "demo-company-au-abcdef12-tb-2026-06-30-accrual.csv",
         )
         self.assertEqual(
             self._name("Smith & Co. Pty Ltd"),
-            "smith-co.-pty-ltd-tb-2026-06-30-accrual.csv",
+            "smith-co.-pty-ltd-abcdef12-tb-2026-06-30-accrual.csv",
         )
 
     def test_a_name_that_sanitises_away_falls_back_to_the_tenant_id(self):
@@ -735,6 +789,56 @@ class FlattenReportShapeTest(unittest.TestCase):
         self.assertTrue(message.startswith("error: "), message)
         self.assertIn("None", message)
 
+    def test_a_non_string_cell_value_exits_instead_of_crashing(self):
+        """The cell the section Title labels was left unguarded when the
+        Title itself was fixed.
+
+        ACCOUNT_PATTERN.match on a mapping raises "expected string or
+        bytes-like object", and a Header cell holding a list raises
+        "unhashable type" at record[title]. Both are raw tracebacks, printed
+        after the tenant name has reached stdout and after the single-use
+        refresh token behind the report call has been spent.
+        """
+        for value in ({"nested": 1}, ["Cash"], True):
+            with self.subTest(value=value):
+                with self.assertRaises(SystemExit) as ctx:
+                    export_tb.flatten_report(
+                        self._payload([value, "1200.00", "", "1200.00", ""])
+                    )
+                message = str(ctx.exception)
+                self.assertTrue(message.startswith("error: "), message)
+                self.assertIn("not text or a number", message)
+                self.assertIn("Assets", message)
+
+    def test_a_non_string_header_title_exits_instead_of_crashing(self):
+        for title in ({"nested": 1}, ["Account"]):
+            with self.subTest(title=title):
+                with self.assertRaises(SystemExit) as ctx:
+                    export_tb.flatten_report(
+                        self._payload(
+                            ["Cash (090)", "1200.00", "", "1200.00", ""],
+                            header=[title, "Debit", "Credit", "YTD Debit", "YTD Credit"],
+                        )
+                    )
+                message = str(ctx.exception)
+                self.assertTrue(message.startswith("error: "), message)
+                self.assertIn("not text or a number", message)
+
+    def test_a_null_or_numeric_cell_value_is_still_read(self):
+        """The two JSON shapes that are not a shape change.
+
+        A null cell is the blank the report format uses for a nil balance -
+        the same thing a missing Value key has always meant here, and what
+        to_number reads as zero. A JSON number is an amount written another
+        way, which to_number has always coerced with str(). Refusing either
+        would throw away a fetched report over a cell that carries no
+        ambiguity.
+        """
+        _, flat = export_tb.flatten_report(self._payload([None, 1200, 0.0, 1200, 0.0]))
+        self.assertEqual(flat[0]["Account"], "")
+        self.assertEqual(flat[0]["Debit"], "1200")
+        self.assertEqual(export_tb.to_number(flat[0]["Credit"]), Decimal("0"))
+
     def test_a_matching_row_still_flattens(self):
         titles, flat = export_tb.flatten_report(
             self._payload(["Cash (090)", "1200.00", "", "1200.00", ""])
@@ -798,6 +902,45 @@ class FlattenReportShapeTest(unittest.TestCase):
         }
         _, flat = export_tb.flatten_report(payload)
         self.assertEqual(flat[0]["AccountID"], "the-account-guid")
+
+    def test_a_non_string_account_attribute_never_reaches_the_csv(self):
+        """The join key takes the same rule as a cell Value.
+
+        AccountID is written out verbatim, so an attribute Value the API sent
+        as an object would land in the column the README sells as a GUID -
+        as its Python repr, with no error anywhere.
+        """
+        payload = {
+            "Rows": [
+                {"RowType": "Header", "Cells": [{"Value": t} for t in HEADER]},
+                {
+                    "RowType": "Section",
+                    "Title": "Assets",
+                    "Rows": [
+                        {
+                            "RowType": "Row",
+                            "Cells": [
+                                {
+                                    "Value": "Cash (090)",
+                                    "Attributes": [
+                                        {"Value": {"nested": 1}, "Id": "account"}
+                                    ],
+                                },
+                                {"Value": "1.00"},
+                                {"Value": ""},
+                                {"Value": "1.00"},
+                                {"Value": ""},
+                            ],
+                        }
+                    ],
+                },
+            ]
+        }
+        with self.assertRaises(SystemExit) as ctx:
+            export_tb.flatten_report(payload)
+        message = str(ctx.exception)
+        self.assertTrue(message.startswith("error: "), message)
+        self.assertIn("not text or a number", message)
 
     def test_every_nested_list_must_hold_objects(self):
         """main() proves the Reports envelope is a list of objects and the
@@ -875,6 +1018,62 @@ class FlattenReportShapeTest(unittest.TestCase):
         message = str(ctx.exception)
         self.assertNotIn("\x1b", message)
         self.assertNotIn("\n", message)
+
+
+class NonStringCellExportTest(_ExportCase):
+    """The same guard end to end, where the cost is visible.
+
+    By the time a cell is read the report has been fetched, the tenant name
+    is on stdout and this run's single-use refresh token is spent, so a cell
+    Value the API sent as an object has to read as an instruction rather than
+    as a TypeError traceback in a scheduled task's log.
+    """
+
+    def test_an_object_in_the_account_cell_exits_with_an_instruction(self):
+        raised, out, data = self.run_export(
+            [
+                ({"nested": 1}, "100.00", "", "100.00", ""),
+                ("Equity (960)", "", "100.00", "", "100.00"),
+            ]
+        )
+        self.assertIsInstance(raised, SystemExit)
+        message = str(raised.code)
+        self.assertTrue(message.startswith("error: "), message)
+        self.assertIn("not text or a number", message)
+        self.assertIn("API shape may have changed", message)
+        self.assertIn("Tenant: Sample Trading Pty Ltd", out)
+        self.assertIsNone(data, "a report this script could not read reached disk")
+
+
+class RawPayloadGuardTest(_ExportCase):
+    """Two guards between api_get and the flattener.
+
+    Both fire after the report call is spent, and the second one is what
+    stops a header-only CSV landing at the path a scheduled Power BI refresh
+    reads.
+    """
+
+    def test_a_response_that_is_not_a_json_object_exits_cleanly(self):
+        for payload in ("TrialBalance", ["Reports"], 7, None):
+            with self.subTest(payload=payload):
+                raised, _, data = self.run_export([], payload=payload)
+                self.assertIsInstance(raised, SystemExit)
+                message = str(raised.code)
+                self.assertTrue(message.startswith("error: "), message)
+                self.assertIn("not a JSON object", message)
+                self.assertIsNone(data)
+
+    def test_a_header_only_report_writes_no_csv(self):
+        payload = {
+            "Reports": [
+                {"Rows": [{"RowType": "Header", "Cells": [{"Value": t} for t in HEADER]}]}
+            ]
+        }
+        raised, out, data = self.run_export([], payload=payload)
+        self.assertIsInstance(raised, SystemExit)
+        self.assertIn("no account rows", str(raised.code))
+        self.assertNotIn("Balance check OK", out)
+        self.assertIsNone(data, "a header-only CSV reached the refresh path")
 
 
 class ColumnTitleGuardTest(_ExportCase):

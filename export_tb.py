@@ -58,13 +58,15 @@ def flatten_report(report: dict) -> tuple[list[str], list[dict]]:
     Header titles. SummaryRow (section totals) is skipped — totals are
     recomputed, not trusted.
 
-    Every nested list is checked before it is walked. main() proves the
-    Reports envelope is a list of objects, and the strict zip below proves a
-    row's cell count; without these checks everything between those two was
-    unguarded, so a Rows, Cells or Attributes value that was a string, a
-    mapping or a list of strings called .get() on a str and printed a raw
-    AttributeError traceback — after the tenant name had gone to stdout and
-    the single-use refresh token behind the report call had been spent.
+    Every nested list is checked before it is walked, and so is every scalar
+    taken out of one. main() proves the Reports envelope is a list of
+    objects, and the strict zip below proves a row's cell count; without
+    these checks everything between those two was unguarded, so a Rows, Cells
+    or Attributes value that was a string, a mapping or a list of strings
+    called .get() on a str and printed a raw AttributeError traceback — after
+    the tenant name had gone to stdout and the single-use refresh token
+    behind the report call had been spent. cell_text() below draws the same
+    line around a cell's Value.
     """
     column_titles: list[str] = []
     flat: list[dict] = []
@@ -80,8 +82,38 @@ def flatten_report(report: dict) -> tuple[list[str], list[dict]]:
             )
         return value
 
+    def cell_text(value: object, where: str) -> str:
+        """A cell's Value as the text every caller already assumes it is.
+
+        object_list proves the containers; this proves the scalar inside
+        one. A missing Value and a JSON null are the blank cell the report
+        format uses for a nil balance, and a JSON number is an amount
+        written another way — to_number has always coerced one with str().
+        Anything else is a shape change, and it used to arrive as a raw
+        traceback rather than as an instruction: ACCOUNT_PATTERN.match on a
+        mapping raised TypeError, and a Header cell holding a list raised
+        "unhashable type" at record[title]. Both landed after the tenant name
+        had gone to stdout and the single-use refresh token behind the report
+        call had been spent, which is the failure mode every guard in this
+        function exists to prevent.
+        """
+        if value is None:
+            return ""
+        if isinstance(value, str):
+            return value
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            return str(value)
+        raise SystemExit(
+            f"error: report {where} has a cell Value that is not text or a "
+            f"number ({type(value).__name__}). The API shape may have "
+            "changed, or this is not a trial balance report."
+        )
+
     def cell_values(row: dict, where: str) -> list[str]:
-        return [c.get("Value", "") for c in object_list(row, "Cells", where)]
+        return [
+            cell_text(c.get("Value", ""), where)
+            for c in object_list(row, "Cells", where)
+        ]
 
     def account_id(row: dict, where: str) -> str:
         # Every data cell carries Attributes: [{"Value": "<account guid>",
@@ -91,7 +123,10 @@ def flatten_report(report: dict) -> tuple[list[str], list[dict]]:
             return ""
         for attr in object_list(cells[0], "Attributes", where):
             if attr.get("Id") == "account":
-                return attr.get("Value", "")
+                # Same rule as a cell Value: this one reaches the CSV as the
+                # join key the README sells, so a mapping here would be
+                # written out as its repr.
+                return cell_text(attr.get("Value", ""), where)
         return ""
 
     for top in object_list(report, "Rows", "top level"):
@@ -259,39 +294,37 @@ def validated_connections(value: object) -> list[dict]:
 FILENAME_UNSAFE = re.compile(r"[^A-Za-z0-9._-]+")
 
 
-def drops_non_ascii(name: str) -> bool:
-    """True when sanitising this org name would throw a character away.
-
-    FILENAME_UNSAFE keeps ASCII letters, digits, ".", "_" and "-", so every
-    other character - CJK, Cyrillic, a macron, an emoji, fullwidth
-    punctuation, a combining mark - collapses to "-". Any one of them is
-    enough to leave two different orgs sharing a stem, so the test is whether
-    the name holds a character outside ASCII at all.
-
-    The narrower "does it hold a letter or digit outside ASCII" test this
-    replaces missed every collision that does not involve a letter: an emoji,
-    a fullwidth comma and a combining macron all return False from
-    str.isalnum(), so two org names differing only in their emoji both
-    sanitised to "pty-ltd" and the second export overwrote the first.
-    """
-    return any(ord(ch) > 127 for ch in name)
-
-
 def default_output_filename(tenant: dict, report_date: str, basis: str) -> str:
-    """{entity}-{report}-{period-end}-{basis}: matches the file convention in
-    the sibling repos, and keeps cash vs accrual runs from overwriting each
-    other.
+    """{entity}-{tenant-id}-{report}-{period-end}-{basis}: matches the file
+    convention in the sibling repos, and keeps cash vs accrual runs from
+    overwriting each other.
 
     The entity segment is the org name lowercased with every run of
     characters outside ASCII letters, digits, ".", "_" and "-" collapsed to
-    one "-". That is lossy for a name written in any other script, and two
-    different orgs can collapse onto one filename: two orgs whose names
-    differ only in their Chinese characters and both end "Pty Ltd" sanitise
-    to "pty-ltd" alike, so the second scheduled export silently overwrote the
-    first client's trial balance. When any character outside ASCII is
-    dropped, the first eight characters of the tenant ID are appended to keep
-    the two apart. A name that sanitises away to nothing still falls back to
-    the tenant ID alone, and an all-ASCII name is unchanged.
+    one "-". That transform loses information in more ways than one, and
+    every one of them can put two different orgs on the same filename, where
+    the second scheduled export silently overwrites the first client's trial
+    balance:
+
+      * everything outside ASCII is dropped, so two names differing only in
+        their Chinese characters and both ending "Pty Ltd" become "pty-ltd";
+      * ASCII punctuation collapses to the same "-" a space does, so "Acme
+        (Holdings) Pty Ltd" and "Acme Holdings Pty Ltd" become
+        "acme-holdings-pty-ltd";
+      * case is folded, so "ACME Pty Ltd" and "Acme Pty Ltd" agree too.
+
+    So the first eight characters of the tenant ID are appended to every
+    default filename, not only to the ones that lose a character outside
+    ASCII. That earlier rule was the whole defect: it read the first bullet
+    as the whole problem and left the other two producing exactly the harm
+    it was written to stop. The tenant ID is the only value here that Xero
+    guarantees is distinct per organisation, so it is the only thing that can
+    keep two orgs apart. It is sanitised like the stem because it is remote
+    input as well: unsanitised, a "/" or "\\" in it turns the default
+    filename into a path, and main() creates the output directory before
+    writing - so the export would silently land in a directory tree nobody
+    asked for instead of failing. A name that sanitises away to nothing
+    leaves the tenant ID as the whole segment.
 
     The name is composed to NFC first. "Nga" plus a combining macron and the
     composed "Ngā" are one org name typed two ways, and without this they
@@ -300,18 +333,9 @@ def default_output_filename(tenant: dict, report_date: str, basis: str) -> str:
     """
     name = unicodedata.normalize("NFC", tenant["tenantName"])
     stem = FILENAME_UNSAFE.sub("-", name).strip("-").lower()
-    # The tenant ID is remote input too, and it now reaches the filename on
-    # every non-ASCII name rather than only in the rare all-symbol fallback.
-    # Unsanitised, a "/" or "\" in it turns the default filename into a path,
-    # and main() creates the output directory before writing - so the export
-    # would silently land in a directory tree nobody asked for instead of
-    # failing. Sanitise it exactly like the stem.
     discriminator = FILENAME_UNSAFE.sub("-", tenant["tenantId"])[:8].strip("-")
-    if not stem:  # all-symbol or wholly non-ASCII org names sanitise to nothing
-        stem = discriminator
-    elif drops_non_ascii(name):
-        stem = f"{stem}-{discriminator}"
-    return f"{stem}-tb-{report_date}-{basis}.csv"
+    entity = "-".join(part for part in (stem, discriminator) if part)
+    return f"{entity}-tb-{report_date}-{basis}.csv"
 
 
 def output_path(value: str | None, default_filename: str, *, root: str | None = None) -> str:
@@ -384,7 +408,7 @@ def main() -> None:
 
     connections = validated_connections(get_connections(creds))
     if not connections:
-        sys.exit("No Xero organisations authorised for this app — run auth.py again.")
+        sys.exit("No Xero organisations authorised for this app - run auth.py again.")
     if args.tenant:
         matches = [c for c in connections if args.tenant.lower() in c["tenantName"].lower()]
         if not matches:
@@ -392,12 +416,12 @@ def main() -> None:
             sys.exit(f'No tenant matching "{args.tenant}". Connected: {names}')
         if len(matches) > 1:
             names = ", ".join(c["tenantName"] for c in matches)
-            sys.exit(f'"{args.tenant}" matches more than one organisation ({names}) — narrow it.')
+            sys.exit(f'"{args.tenant}" matches more than one organisation ({names}) - narrow it.')
         tenant = matches[0]
     else:
         if len(connections) > 1:
             names = ", ".join(c["tenantName"] for c in connections)
-            sys.exit(f"More than one organisation connected ({names}) — pick one with --tenant.")
+            sys.exit(f"More than one organisation connected ({names}) - pick one with --tenant.")
         tenant = connections[0]
     print(f"Tenant: {tenant['tenantName']}")
 
@@ -410,20 +434,20 @@ def main() -> None:
         sys.exit("error: Xero Trial Balance response is not a JSON object.")
     reports = payload.get("Reports", [])
     if not reports:
-        sys.exit("Empty Reports payload — check the date parameter and API scopes.")
+        sys.exit("Empty Reports payload - check the date parameter and API scopes.")
     if not isinstance(reports, list) or not isinstance(reports[0], dict):
         sys.exit("error: Xero Trial Balance response has an unexpected Reports shape.")
 
     column_titles, rows = flatten_report(reports[0])
     if not rows:
-        sys.exit("Report contained no account rows — nothing to export.")
+        sys.exit("Report contained no account rows - nothing to export.")
 
     # The strict zip in flatten_report only catches a cell-COUNT change; a
     # retitled column (count unchanged) would slip through and silently zero
     # every value via record.get(). Guard the titles themselves.
     missing = {"Account", "Debit", "Credit", "YTD Debit", "YTD Credit"} - set(column_titles)
     if missing:
-        sys.exit(f"Unexpected report columns — missing {sorted(missing)}. Has the API shape changed?")
+        sys.exit(f"Unexpected report columns - missing {sorted(missing)}. Has the API shape changed?")
 
     basis = "cash" if args.payments_only else "accrual"
     try:
@@ -505,7 +529,7 @@ def main() -> None:
             )
             unbalanced = True
     if unbalanced:
-        print("Nothing written — report likely truncated or misparsed.")
+        print("Nothing written - report likely truncated or misparsed.")
         sys.exit(1)
 
     # Atomic write (temp file + replace), mirroring save_tokens(): a crash

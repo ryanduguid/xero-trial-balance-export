@@ -42,9 +42,13 @@ DEFAULT_EXPIRES_IN = 1800
 # refresh token instead of trusting the cached access token.
 TOKEN_CLOCK_SKEW = 300
 
-# os.replace onto token.json fails on Windows while any other process holds
-# the destination open, and the README tells users a second concurrent run is
-# possible. Ride out a brief lock rather than losing the new refresh token.
+# os.replace fails on Windows while any other process holds the destination
+# open. Both durable writes in this project ride out a brief lock rather than
+# losing work, and both read these two constants, so retuning them changes
+# both: save_tokens onto token.json (the README tells users a second
+# concurrent run is possible, and a lost refresh token locks the app out) and
+# export_tb's CSV write onto a path Excel or Power BI Desktop may be holding
+# open, where the lost work is a report that cannot be re-fetched for free.
 REPLACE_ATTEMPTS = 5
 REPLACE_BACKOFF = 0.2
 
@@ -260,6 +264,18 @@ def get_access_token(client_id: str, client_secret: str, force: bool = False) ->
         raise SystemExit(
             "Refresh token rejected (already used or expired). "
             "Re-authorise with: python auth.py"
+        )
+    # A mistyped XERO_CLIENT_SECRET is the other everyday failure here, and
+    # the token endpoint answers it with 401 (OAuth2 invalid_client). Without
+    # this branch raise_for_status printed a bare HTTPError traceback naming
+    # the identity endpoint, which reads as a Xero outage rather than a typo
+    # in .env. The stored refresh token is untouched either way.
+    if resp.status_code == 401:
+        raise SystemExit(
+            "Xero rejected this app's credentials when refreshing the token "
+            "(HTTP 401). Check XERO_CLIENT_ID and XERO_CLIENT_SECRET in .env "
+            "against the app at developer.xero.com; token.json was left "
+            "as it was."
         )
     resp.raise_for_status()
     try:

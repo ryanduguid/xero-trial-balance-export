@@ -1,7 +1,9 @@
+import argparse
 import io
 import os
 import sys
 import tempfile
+import unicodedata
 import unittest
 from contextlib import redirect_stdout
 from decimal import Decimal
@@ -75,7 +77,7 @@ class OutputPathTests(unittest.TestCase):
 HEADER = ["Account", "Debit", "Credit", "YTD Debit", "YTD Credit"]
 
 
-def _report(accounts, section="Assets"):
+def _report(accounts, section="Assets", header=HEADER):
     """Build a Trial Balance payload.
 
     accounts: [(account_label, debit, credit, ytd_debit, ytd_credit), ...]
@@ -83,7 +85,7 @@ def _report(accounts, section="Assets"):
     rows = [
         {
             "RowType": "Header",
-            "Cells": [{"Value": title} for title in HEADER],
+            "Cells": [{"Value": title} for title in header],
         }
     ]
     data_rows = []
@@ -120,17 +122,35 @@ class _ExportCase(unittest.TestCase):
     same shape a scheduled job uses.
     """
 
-    def run_export(self, accounts, date="2026-06-30"):
-        """Return (SystemExit or None, stdout, csv bytes or None)."""
+    def run_export(
+        self,
+        accounts,
+        date="2026-06-30",
+        *,
+        out="tb.csv",
+        tenant_name="Sample Trading Pty Ltd",
+        tenant_id="tenant-guid",
+        section="Assets",
+        header=HEADER,
+    ):
+        """Return (SystemExit or None, stdout, csv bytes or None).
+
+        out=None omits --out entirely, which is the path that resolves the
+        default filename; the scratch directory is left on self.work_dir so a
+        caller can inspect a filename it did not choose.
+        """
         work_dir = tempfile.mkdtemp()
-        out_path = os.path.join(work_dir, "tb.csv")
-        payload = _report(accounts)
-        argv = ["export_tb.py", "--date", date, "--out", "tb.csv"]
+        self.work_dir = work_dir
+        out_path = None if out is None else os.path.join(work_dir, out)
+        payload = _report(accounts, section=section, header=header)
+        argv = ["export_tb.py", "--date", date]
+        if out is not None:
+            argv += ["--out", out]
         env = {
             "XERO_CLIENT_ID": "id-not-a-secret",
             "XERO_CLIENT_SECRET": "secret-not-used",
         }
-        connections = [{"tenantId": "tenant-guid", "tenantName": "Sample Trading Pty Ltd"}]
+        connections = [{"tenantId": tenant_id, "tenantName": tenant_name}]
         buffer = io.StringIO()
         raised = None
         previous_dir = os.getcwd()
@@ -149,7 +169,7 @@ class _ExportCase(unittest.TestCase):
         finally:
             os.chdir(previous_dir)
         data = None
-        if os.path.exists(out_path):
+        if out_path is not None and os.path.exists(out_path):
             with open(out_path, "rb") as fh:
                 data = fh.read()
         return raised, buffer.getvalue(), data
@@ -294,6 +314,612 @@ class DecimalMoneyTest(_ExportCase):
         self.assertIsNone(raised)
         self.assertIn(b"9007199254740993.0", data)
         self.assertNotIn(b"9007199254740992.0", data)
+
+
+class BalanceCheckTest(_ExportCase):
+    """Both pairs are checked, not just the movement pair.
+
+    Every other unbalanced fixture in this file moves the movement pair and
+    the YTD pair by the same amount, so the movement branch alone satisfies
+    them and the YTD tuple in the loop could be deleted unnoticed. The YTD
+    columns are the ones the README tells users to slice for a year-end.
+    """
+
+    def test_a_balanced_movement_does_not_excuse_an_unbalanced_ytd(self):
+        raised, out, data = self.run_export(
+            [
+                ("Cash (090)", "100.00", "", "100.00", ""),
+                ("Equity (960)", "", "100.00", "", "90.00"),
+            ]
+        )
+        self.assertIsInstance(raised, SystemExit)
+        self.assertEqual(raised.code, 1)
+        self.assertIn("WARNING: YTD debits", out)
+        self.assertIn("diff 10.0", out)
+        self.assertNotIn("WARNING: movement debits", out)
+        self.assertIsNone(data, "an unbalanced YTD pair must not reach disk")
+
+    def test_a_balanced_ytd_does_not_excuse_an_unbalanced_movement(self):
+        raised, out, data = self.run_export(
+            [
+                ("Cash (090)", "100.00", "", "100.00", ""),
+                ("Equity (960)", "", "90.00", "", "100.00"),
+            ]
+        )
+        self.assertIsInstance(raised, SystemExit)
+        self.assertEqual(raised.code, 1)
+        self.assertIn("WARNING: movement debits", out)
+        self.assertNotIn("WARNING: YTD debits", out)
+        self.assertIsNone(data)
+
+
+class ExcelSafeTest(unittest.TestCase):
+    """Formula injection: account and org names are free text anyone in the
+    client's Xero org can edit, and the CSV is built for double-click opening
+    in Excel."""
+
+    def test_every_owasp_trigger_is_forced_to_text(self):
+        for trigger in ("=", "+", "-", "@", "\t", "\r", "\n"):
+            with self.subTest(trigger=trigger):
+                self.assertEqual(
+                    export_tb.excel_safe(trigger + "cmd|'/c calc'!A1"),
+                    "'" + trigger + "cmd|'/c calc'!A1",
+                )
+
+    def test_ordinary_values_pass_through_untouched(self):
+        for value in ("", "090", "Business Bank Account", "Rent (Sydney)",
+                      "Smith & Co. Pty Ltd", "Sales =revenue"):
+            with self.subTest(value=value):
+                self.assertEqual(export_tb.excel_safe(value), value)
+
+
+class ExcelInjectionExportTest(_ExportCase):
+    def test_the_apostrophe_reaches_the_csv_for_every_free_text_column(self):
+        raised, _, data = self.run_export(
+            [
+                ("=cmd|'/c calc'!A1 (090)", "1200.00", "", "1200.00", ""),
+                ("Trade Debtors (610)", "", "1200.00", "", "1200.00"),
+            ],
+            tenant_name='=HYPERLINK("http://x")',
+            section="+Assets",
+        )
+        self.assertIsNone(raised)
+        text = data.decode("utf-8-sig")
+        self.assertIn("'=cmd|'/c calc'!A1", text)  # AccountName
+        self.assertIn("'+Assets", text)  # Section
+        self.assertIn("'=HYPERLINK", text)  # Tenant
+        self.assertNotIn(",=cmd", text)
+
+
+class DefaultFilenameTest(unittest.TestCase):
+    """The sanitiser keeps ASCII letters and digits only, so it can collapse
+    two different orgs onto one filename and let the second export overwrite
+    the first client's numbers."""
+
+    ID = "abcdef12-3456-7890-1234-567890abcdef"
+
+    def _name(self, tenant_name, tenant_id=None):
+        tenant = {"tenantName": tenant_name, "tenantId": tenant_id or self.ID}
+        return export_tb.default_output_filename(tenant, "2026-06-30", "accrual")
+
+    def test_two_orgs_differing_only_outside_ascii_get_different_filenames(self):
+        first = self._name("美食餐厅 Pty Ltd", "11111111-aaaa")
+        second = self._name("东方贸易 Pty Ltd", "22222222-bbbb")
+        self.assertEqual(first, "pty-ltd-11111111-tb-2026-06-30-accrual.csv")
+        self.assertEqual(second, "pty-ltd-22222222-tb-2026-06-30-accrual.csv")
+        self.assertNotEqual(first, second)
+
+    def test_a_dropped_letter_is_enough_to_add_the_discriminator(self):
+        self.assertEqual(
+            self._name("Ngā Taonga Ltd"),
+            "ng-taonga-ltd-abcdef12-tb-2026-06-30-accrual.csv",
+        )
+
+    def test_names_differing_only_in_a_non_alphanumeric_character_still_split(self):
+        """The collision does not need a letter. An emoji, a fullwidth comma
+        and a combining macron are all str.isalnum() == False, and all three
+        collapse to "-" like any other character outside ASCII."""
+        for first_name, second_name, stem in (
+            ("\U0001F40D Pty Ltd", "\U0001F986 Pty Ltd", "pty-ltd"),
+            ("Wong，Li Pty Ltd", "Wong；Li Pty Ltd", "wong-li-pty-ltd"),
+        ):
+            with self.subTest(names=(first_name, second_name)):
+                first = self._name(first_name, "11111111-aaaa")
+                second = self._name(second_name, "22222222-bbbb")
+                self.assertEqual(first, f"{stem}-11111111-tb-2026-06-30-accrual.csv")
+                self.assertEqual(second, f"{stem}-22222222-tb-2026-06-30-accrual.csv")
+                self.assertNotEqual(first, second)
+
+    def test_a_decomposed_name_writes_the_same_file_as_its_composed_form(self):
+        """Same org, same file, whichever normalisation form the API sends."""
+        composed = "Ngā Taonga Ltd"
+        decomposed = unicodedata.normalize("NFD", composed)
+        self.assertNotEqual(composed, decomposed)
+        self.assertEqual(self._name(decomposed), self._name(composed))
+
+    def test_a_tenant_id_cannot_turn_the_default_name_into_a_path(self):
+        """The discriminator is remote input as well, and main() creates the
+        output directory before writing - so an unsanitised separator in it
+        would put the export in a directory tree nobody asked for."""
+        for tenant_id in ("aa/bb/cc-dd", "aa\\bb\\cc-dd", "../../etc"):
+            with self.subTest(tenant_id=tenant_id):
+                filename = self._name("美食 Pty Ltd", tenant_id)
+                self.assertNotIn("/", filename)
+                self.assertNotIn("\\", filename)
+                self.assertEqual(os.path.basename(filename), filename)
+        self.assertEqual(
+            self._name("美食 Pty Ltd", "aa/bb/cc-dd"),
+            "pty-ltd-aa-bb-cc-tb-2026-06-30-accrual.csv",
+        )
+
+    def test_an_all_ascii_org_name_keeps_the_documented_filename(self):
+        self.assertEqual(
+            self._name("Demo Company (AU)"),
+            "demo-company-au-tb-2026-06-30-accrual.csv",
+        )
+        self.assertEqual(
+            self._name("Smith & Co. Pty Ltd"),
+            "smith-co.-pty-ltd-tb-2026-06-30-accrual.csv",
+        )
+
+    def test_a_name_that_sanitises_away_falls_back_to_the_tenant_id(self):
+        self.assertEqual(self._name("***"), "abcdef12-tb-2026-06-30-accrual.csv")
+        self.assertEqual(
+            self._name("美食"), "abcdef12-tb-2026-06-30-accrual.csv"
+        )
+
+    def test_cash_and_accrual_runs_do_not_overwrite_each_other(self):
+        tenant = {"tenantName": "Demo Company", "tenantId": self.ID}
+        self.assertNotEqual(
+            export_tb.default_output_filename(tenant, "2026-06-30", "accrual"),
+            export_tb.default_output_filename(tenant, "2026-06-30", "cash"),
+        )
+
+
+class DefaultFilenameExportTest(_ExportCase):
+    def test_a_run_without_out_writes_the_discriminated_default_name(self):
+        raised, out, _ = self.run_export(
+            [
+                ("Cash (090)", "100.00", "", "100.00", ""),
+                ("Equity (960)", "", "100.00", "", "100.00"),
+            ],
+            out=None,
+            tenant_name="Ngā Taonga Ltd",
+            tenant_id="abcdef12-3456-7890",
+        )
+        self.assertIsNone(raised)
+        self.assertEqual(
+            sorted(os.listdir(self.work_dir)),
+            ["ng-taonga-ltd-abcdef12-tb-2026-06-30-accrual.csv"],
+        )
+        self.assertIn("ng-taonga-ltd-abcdef12-tb-2026-06-30-accrual.csv", out)
+
+    def test_a_default_run_creates_no_directory_under_the_working_directory(self):
+        """A run with no --out must write one CSV in the working directory.
+        The output directory is created before the write, so a separator in
+        the tenant ID would otherwise materialise a tree here."""
+        raised, out, _ = self.run_export(
+            [
+                ("Cash (090)", "100.00", "", "100.00", ""),
+                ("Equity (960)", "", "100.00", "", "100.00"),
+            ],
+            out=None,
+            tenant_name="美食 Pty Ltd",
+            tenant_id="aa/bb/cc-dd",
+        )
+        self.assertIsNone(raised)
+        entries = sorted(os.listdir(self.work_dir))
+        self.assertEqual(entries, ["pty-ltd-aa-bb-cc-tb-2026-06-30-accrual.csv"])
+        self.assertFalse(
+            [e for e in entries if os.path.isdir(os.path.join(self.work_dir, e))],
+            "the default filename created a directory tree",
+        )
+        self.assertIn("pty-ltd-aa-bb-cc-tb-2026-06-30-accrual.csv", out)
+
+
+class NestedOutputDirectoryTest(_ExportCase):
+    """--out exports/tb.csv is accepted by output_path, so the parent may not
+    exist when the CSV is written - which used to be a FileNotFoundError
+    traceback raised after the report had been fetched and this run's
+    single-use refresh token spent."""
+
+    def test_a_missing_parent_directory_is_created_rather_than_crashing(self):
+        raised, out, data = self.run_export(
+            [
+                ("Cash (090)", "100.00", "", "100.00", ""),
+                ("Equity (960)", "", "100.00", "", "100.00"),
+            ],
+            out="exports/tb.csv",
+        )
+        self.assertIsNone(raised)
+        self.assertIsNotNone(data, "the export did not reach the nested path")
+        self.assertIn(b"Cash", data)
+        self.assertEqual(os.listdir(os.path.join(self.work_dir, "exports")), ["tb.csv"])
+
+
+class OutputReplaceLockTest(_ExportCase):
+    """Windows refuses os.replace onto a CSV that Excel or Power BI Desktop
+    holds open, which is the README's own scheduled-refresh recipe. The
+    finished, balance-checked export must survive that."""
+
+    BALANCED = [
+        ("Cash (090)", "100.00", "", "100.00", ""),
+        ("Equity (960)", "", "100.00", "", "100.00"),
+    ]
+
+    def test_a_transient_lock_is_ridden_out(self):
+        real_replace = os.replace
+        calls = []
+
+        def flaky(src, dst):
+            calls.append(src)
+            if len(calls) < 3:
+                raise PermissionError(13, "Access is denied")
+            return real_replace(src, dst)
+
+        with mock.patch.object(export_tb.os, "replace", side_effect=flaky), \
+                mock.patch.object(export_tb.time, "sleep") as sleep:
+            raised, _, data = self.run_export(self.BALANCED)
+
+        self.assertIsNone(raised)
+        self.assertEqual(len(calls), 3)
+        self.assertIsNotNone(data)
+        self.assertEqual(
+            [c.args[0] for c in sleep.call_args_list],
+            [export_tb.REPLACE_BACKOFF * 1, export_tb.REPLACE_BACKOFF * 2],
+        )
+        self.assertEqual(
+            [f for f in os.listdir(self.work_dir) if f.endswith(".tmp")], []
+        )
+
+    def test_a_held_destination_keeps_the_finished_export_and_names_it(self):
+        err = PermissionError(13, "Access is denied")
+        with mock.patch.object(export_tb.os, "replace", side_effect=err), \
+                mock.patch.object(export_tb.time, "sleep") as sleep:
+            raised, _, data = self.run_export(self.BALANCED)
+
+        self.assertIsInstance(raised, SystemExit)
+        message = str(raised.code)
+        self.assertTrue(message.startswith("error: "), message)
+        self.assertIn("tb.csv", message)
+        self.assertEqual(sleep.call_count, export_tb.REPLACE_ATTEMPTS - 1)
+        self.assertIsNone(data, "os.replace never ran, so nothing is at --out")
+
+        leftovers = [f for f in os.listdir(self.work_dir) if f.endswith(".tmp")]
+        self.assertEqual(
+            len(leftovers), 1, "the completed export was deleted, not kept"
+        )
+        tmp_path = os.path.join(self.work_dir, leftovers[0])
+        self.assertIn(tmp_path, message)
+        with open(tmp_path, "rb") as fh:
+            recovered = fh.read()
+        self.assertIn(b"Cash", recovered)
+        self.assertIn(b"ReportDate,Tenant,Section", recovered)
+
+
+class FlattenReportShapeTest(unittest.TestCase):
+    """A cell-count change and a missing Header row both hit the strict zip.
+    Neither is a bug in this script, so neither should print a traceback."""
+
+    def _payload(self, cells, header=HEADER, title="Assets"):
+        rows = []
+        if header is not None:
+            rows.append(
+                {"RowType": "Header", "Cells": [{"Value": t} for t in header]}
+            )
+        rows.append(
+            {
+                "RowType": "Section",
+                "Title": title,
+                "Rows": [{"RowType": "Row", "Cells": [{"Value": v} for v in cells]}],
+            }
+        )
+        return {"Rows": rows}
+
+    def test_a_matching_row_still_flattens(self):
+        titles, flat = export_tb.flatten_report(
+            self._payload(["Cash (090)", "1200.00", "", "1200.00", ""])
+        )
+        self.assertEqual(titles, HEADER)
+        self.assertEqual(flat[0]["Account"], "Cash (090)")
+        self.assertEqual(flat[0]["Section"], "Assets")
+
+    def test_an_extra_cell_exits_cleanly_instead_of_raising_valueerror(self):
+        with self.assertRaises(SystemExit) as ctx:
+            export_tb.flatten_report(
+                self._payload(["Cash (090)", "1200.00", "", "1200.00", "", "extra"])
+            )
+        message = str(ctx.exception)
+        self.assertTrue(message.startswith("error: "), message)
+        self.assertIn("6 cells", message)
+        self.assertIn("5 header columns", message)
+        self.assertIn("Assets", message)
+
+    def test_a_missing_cell_is_refused_too(self):
+        with self.assertRaises(SystemExit) as ctx:
+            export_tb.flatten_report(self._payload(["Cash (090)", "1200.00"]))
+        self.assertIn("2 cells", str(ctx.exception))
+
+    def test_a_report_with_no_header_row_exits_cleanly(self):
+        with self.assertRaises(SystemExit) as ctx:
+            export_tb.flatten_report(
+                self._payload(["Cash (090)", "1200.00", "", "1200.00", ""], header=None)
+            )
+        self.assertIn("0 header columns", str(ctx.exception))
+
+    def test_the_join_key_comes_from_the_account_attribute(self):
+        """AccountID is the stable join key the README sells; a data cell can
+        carry more than one attribute, and only the account one is the GUID."""
+        payload = {
+            "Rows": [
+                {"RowType": "Header", "Cells": [{"Value": t} for t in HEADER]},
+                {
+                    "RowType": "Section",
+                    "Title": "Assets",
+                    "Rows": [
+                        {
+                            "RowType": "Row",
+                            "Cells": [
+                                {
+                                    "Value": "Cash (090)",
+                                    "Attributes": [
+                                        {"Value": "not-the-guid", "Id": "rowType"},
+                                        {"Value": "the-account-guid", "Id": "account"},
+                                    ],
+                                },
+                                {"Value": "1.00"},
+                                {"Value": ""},
+                                {"Value": "1.00"},
+                                {"Value": ""},
+                            ],
+                        }
+                    ],
+                },
+            ]
+        }
+        _, flat = export_tb.flatten_report(payload)
+        self.assertEqual(flat[0]["AccountID"], "the-account-guid")
+
+    def test_the_section_title_is_stripped_before_it_reaches_the_terminal(self):
+        with self.assertRaises(SystemExit) as ctx:
+            export_tb.flatten_report(
+                self._payload(["Cash (090)"], title="\x1b[2JAssets\nWARNING: fake")
+            )
+        message = str(ctx.exception)
+        self.assertNotIn("\x1b", message)
+        self.assertNotIn("\n", message)
+
+
+class ColumnTitleGuardTest(_ExportCase):
+    """The strict zip catches a cell-COUNT change only; a retitled column
+    keeps the count and would zero every value through record.get()."""
+
+    def test_a_retitled_column_stops_the_export_before_the_balance_check(self):
+        raised, out, data = self.run_export(
+            [
+                ("Cash (090)", "100.00", "", "100.00", ""),
+                ("Equity (960)", "", "100.00", "", "100.00"),
+            ],
+            header=["Account", "Debit", "Credit", "YTD Dr", "YTD Credit"],
+        )
+        self.assertIsInstance(raised, SystemExit)
+        message = str(raised.code)
+        self.assertIn("Unexpected report columns", message)
+        self.assertIn("YTD Debit", message)
+        self.assertNotIn("WARNING", out)
+        self.assertIsNone(data)
+
+
+class AccountCodeTest(unittest.TestCase):
+    """"Business Bank Account (090)" splits; "Rent (Sydney)" must not, or it
+    collides with the real Rent account on any name-keyed join and puts text
+    in a column typed as a code."""
+
+    def test_a_code_needs_at_least_one_digit(self):
+        self.assertTrue(export_tb.is_account_code("090"))
+        self.assertTrue(export_tb.is_account_code("GST1"))
+        self.assertFalse(export_tb.is_account_code("Sydney"))
+        self.assertFalse(export_tb.is_account_code("NAB"))
+
+    def test_a_code_is_at_most_ten_characters(self):
+        self.assertTrue(export_tb.is_account_code("1234567890"))
+        self.assertFalse(export_tb.is_account_code("12345678901"))
+
+    def test_a_code_is_alphanumeric(self):
+        for value in ("09-0", "09 0", "090.1", ""):
+            with self.subTest(value=value):
+                self.assertFalse(export_tb.is_account_code(value))
+
+
+class ParentheticalAccountExportTest(_ExportCase):
+    def test_a_code_less_parenthetical_keeps_its_whole_name(self):
+        raised, _, data = self.run_export(
+            [
+                ("Rent (Sydney)", "100.00", "", "100.00", ""),
+                ("Term Deposit (NAB12345678901)", "0.00", "", "0.00", ""),
+                ("Equity (960)", "", "100.00", "", "100.00"),
+            ]
+        )
+        self.assertIsNone(raised)
+        text = data.decode("utf-8-sig")
+        self.assertIn(",Rent (Sydney),,", text)
+        self.assertIn(",Term Deposit (NAB12345678901),,", text)
+        self.assertIn(",Equity,960,", text)
+
+
+class TenantSelectionTest(unittest.TestCase):
+    """Picking the wrong org exports one client's numbers under another's
+    name, so an ambiguous --tenant must stop before the report call."""
+
+    def _run(self, connections, extra_argv):
+        work_dir = tempfile.mkdtemp()
+        argv = ["export_tb.py", "--date", "2026-06-30", "--out", "tb.csv"] + extra_argv
+        env = {
+            "XERO_CLIENT_ID": "id-not-a-secret",
+            "XERO_CLIENT_SECRET": "secret-not-used",
+        }
+        previous_dir = os.getcwd()
+        os.chdir(work_dir)
+        try:
+            with mock.patch.object(export_tb, "load_dotenv", lambda *a, **k: None), \
+                    mock.patch.object(export_tb, "get_connections", return_value=connections), \
+                    mock.patch.object(export_tb, "api_get") as api_get, \
+                    mock.patch.dict(os.environ, env, clear=False), \
+                    mock.patch.object(sys, "argv", argv):
+                with redirect_stdout(io.StringIO()):
+                    with self.assertRaises(SystemExit) as ctx:
+                        export_tb.main()
+        finally:
+            os.chdir(previous_dir)
+        return str(ctx.exception), api_get
+
+    TWO = [
+        {"tenantId": "aaaa", "tenantName": "Acme Trading Pty Ltd"},
+        {"tenantId": "bbbb", "tenantName": "Acme Holdings Pty Ltd"},
+    ]
+
+    def test_an_ambiguous_substring_stops_before_the_report_is_fetched(self):
+        message, api_get = self._run(self.TWO, ["--tenant", "Acme"])
+        self.assertIn("matches more than one organisation", message)
+        self.assertIn("Acme Trading Pty Ltd", message)
+        self.assertIn("Acme Holdings Pty Ltd", message)
+        api_get.assert_not_called()
+
+    def test_a_unique_substring_still_selects_its_org(self):
+        connections = self.TWO
+        work_dir = tempfile.mkdtemp()
+        argv = [
+            "export_tb.py", "--date", "2026-06-30", "--out", "tb.csv",
+            "--tenant", "Holdings",
+        ]
+        env = {
+            "XERO_CLIENT_ID": "id-not-a-secret",
+            "XERO_CLIENT_SECRET": "secret-not-used",
+        }
+        payload = _report([("Cash (090)", "1.00", "", "1.00", ""),
+                           ("Equity (960)", "", "1.00", "", "1.00")])
+        previous_dir = os.getcwd()
+        os.chdir(work_dir)
+        buffer = io.StringIO()
+        try:
+            with mock.patch.object(export_tb, "load_dotenv", lambda *a, **k: None), \
+                    mock.patch.object(export_tb, "get_connections", return_value=connections), \
+                    mock.patch.object(export_tb, "api_get", return_value=payload) as api_get, \
+                    mock.patch.dict(os.environ, env, clear=False), \
+                    mock.patch.object(sys, "argv", argv):
+                with redirect_stdout(buffer):
+                    export_tb.main()
+        finally:
+            os.chdir(previous_dir)
+        self.assertIn("Tenant: Acme Holdings Pty Ltd", buffer.getvalue())
+        self.assertEqual(api_get.call_args.kwargs["tenant_id"], "bbbb")
+
+    def test_two_orgs_and_no_tenant_flag_stops_before_the_report(self):
+        message, api_get = self._run(self.TWO, [])
+        self.assertIn("More than one organisation connected", message)
+        api_get.assert_not_called()
+
+    def test_a_substring_matching_nothing_names_the_connected_orgs(self):
+        message, api_get = self._run(self.TWO, ["--tenant", "Beta"])
+        self.assertIn('No tenant matching "Beta"', message)
+        self.assertIn("Acme Trading Pty Ltd", message)
+        api_get.assert_not_called()
+
+
+class StreamEncodingTest(unittest.TestCase):
+    """Non-console stdout on Windows is cp1252 (PEP 528), so a macron or a
+    CJK character in an org name aborted a redirected or scheduled run before
+    the report was ever fetched."""
+
+    def test_both_streams_are_reconfigured_before_anything_is_printed(self):
+        stdout, stderr = mock.Mock(), mock.Mock()
+        with mock.patch.object(sys, "stdout", stdout), \
+                mock.patch.object(sys, "stderr", stderr), \
+                mock.patch.object(sys, "argv", ["export_tb.py", "--out", "../outside.csv"]):
+            with self.assertRaises(SystemExit):
+                export_tb.main()
+        stdout.reconfigure.assert_called_once_with(encoding="utf-8", errors="replace")
+        stderr.reconfigure.assert_called_once_with(encoding="utf-8", errors="replace")
+
+    def test_a_stream_without_reconfigure_does_not_stop_the_run(self):
+        """redirect_stdout hands main() a StringIO, and a pipe on an older
+        interpreter has no reconfigure either."""
+        with mock.patch.object(sys, "stdout", io.StringIO()), \
+                mock.patch.object(sys, "stderr", io.StringIO()), \
+                mock.patch.object(sys, "argv", ["export_tb.py", "--out", "../outside.csv"]):
+            with self.assertRaises(SystemExit) as ctx:
+                export_tb.main()
+        self.assertEqual(ctx.exception.code, 2)
+
+
+class TransportFailureTest(unittest.TestCase):
+    """A scheduled export on a machine that is offline, or behind failing DNS,
+    ended with a requests traceback in the Task Scheduler log. Every other
+    failure in this script is a one-line exit carrying an instruction."""
+
+    def test_a_network_failure_exits_with_one_line(self):
+        import requests
+
+        failure = requests.exceptions.ConnectionError("getaddrinfo failed")
+        with mock.patch.object(export_tb, "main", side_effect=failure):
+            with self.assertRaises(SystemExit) as ctx:
+                export_tb.run()
+        message = str(ctx.exception)
+        self.assertTrue(message.startswith("error: "), message)
+        self.assertIn("could not reach Xero", message)
+        self.assertIn("getaddrinfo failed", message)
+
+    def test_a_read_timeout_is_a_transport_failure_too(self):
+        import requests
+
+        failure = requests.exceptions.ReadTimeout("timed out")
+        with mock.patch.object(export_tb, "main", side_effect=failure):
+            with self.assertRaises(SystemExit) as ctx:
+                export_tb.run()
+        self.assertIn("could not reach Xero", str(ctx.exception))
+
+    def test_an_http_status_is_not_relabelled_as_unreachability(self):
+        """raise_for_status raises HTTPError, a RequestException, for every
+        status xero_client does not answer itself. A 403 for a missing
+        accounting.reports.trialbalance.read scope and a 400 for a bad date
+        both fail again on the next run, so neither may be reported as a
+        transport failure with "re-run later" attached."""
+        import requests
+
+        for status, reason in ((403, "Forbidden"), (400, "Bad Request"), (500, "Server Error")):
+            with self.subTest(status=status):
+                response = requests.Response()
+                response.status_code = status
+                response.url = "https://api.xero.com/api.xro/2.0/Reports/TrialBalance"
+                failure = requests.exceptions.HTTPError(
+                    f"{status} Client Error: {reason} for url: {response.url}",
+                    response=response,
+                )
+                with mock.patch.object(export_tb, "main", side_effect=failure):
+                    with self.assertRaises(requests.exceptions.HTTPError):
+                        export_tb.run()
+
+    def test_a_bug_in_this_script_still_surfaces_as_a_traceback(self):
+        with mock.patch.object(export_tb, "main", side_effect=KeyError("boom")):
+            with self.assertRaises(KeyError):
+                export_tb.run()
+
+    def test_a_clean_run_passes_through(self):
+        with mock.patch.object(export_tb, "main") as main_fn:
+            export_tb.run()
+        main_fn.assert_called_once_with()
+
+
+class IsoDateTest(unittest.TestCase):
+    def test_an_iso_date_passes_through(self):
+        self.assertEqual(export_tb.iso_date("2026-06-30"), "2026-06-30")
+
+    def test_the_au_date_habit_is_refused_with_the_order_spelled_out(self):
+        for raw in ("30/06/2026", "30-06-2026", "not-a-date", "", "2026-02-30"):
+            with self.subTest(raw=raw):
+                with self.assertRaises(argparse.ArgumentTypeError) as ctx:
+                    export_tb.iso_date(raw)
+                self.assertIn("YYYY-MM-DD", str(ctx.exception))
 
 
 class ToNumberTest(unittest.TestCase):

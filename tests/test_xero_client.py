@@ -11,10 +11,11 @@ import xero_client
 
 
 class _Response:
-    def __init__(self, status_code, *, headers=None, payload=None):
+    def __init__(self, status_code, *, headers=None, payload=None, text=""):
         self.status_code = status_code
         self.headers = headers or {}
         self._payload = payload or {}
+        self.text = text
 
     def json(self):
         return self._payload
@@ -244,6 +245,56 @@ class RetryAfterMessageTruthTest(unittest.TestCase):
         sleep.assert_called_once_with(xero_client.RETRY_AFTER_DEFAULT)
 
 
+class ApiGet401Test(unittest.TestCase):
+    """The surprise-401 path: the local expiry math can lie (skewed clock, a
+    token.json copied between machines), so one forced refresh and one retry
+    stand between that and a traceback."""
+
+    def test_a_surprise_401_forces_a_refresh_and_retries_once(self):
+        responses = [_Response(401), _Response(200, payload={"ok": True})]
+        tokens = iter(["stale-token", "fresh-token"])
+        with mock.patch.object(
+            xero_client, "get_access_token", side_effect=lambda *a, **k: next(tokens)
+        ) as get_token, mock.patch.object(
+            xero_client.requests, "get", side_effect=responses
+        ) as get:
+            result = xero_client.api_get(
+                "https://example.test", ("id", "secret"), tenant_id="tenant-guid"
+            )
+
+        self.assertEqual(result, {"ok": True})
+        self.assertEqual(get.call_count, 2)
+        self.assertEqual(get_token.call_count, 2)
+        self.assertNotIn("force", get_token.call_args_list[0].kwargs)
+        self.assertIs(get_token.call_args_list[1].kwargs.get("force"), True)
+        self.assertEqual(
+            get.call_args_list[1].kwargs["headers"]["Authorization"],
+            "Bearer fresh-token",
+        )
+
+    def test_a_second_401_exits_with_reauthorise_guidance(self):
+        with mock.patch.object(xero_client, "get_access_token", return_value="tok"), \
+                mock.patch.object(
+                    xero_client.requests, "get", side_effect=[_Response(401), _Response(401)]
+                ):
+            with self.assertRaises(SystemExit) as ctx:
+                xero_client.api_get("https://example.test", ("id", "secret"))
+        self.assertIn("python auth.py", str(ctx.exception))
+
+    def test_every_request_carries_the_tenant_header_and_a_timeout(self):
+        with mock.patch.object(xero_client, "get_access_token", return_value="tok"), \
+                mock.patch.object(
+                    xero_client.requests, "get", return_value=_Response(200, payload={"ok": True})
+                ) as get:
+            xero_client.api_get(
+                "https://example.test", ("id", "secret"), tenant_id="tenant-guid"
+            )
+        kwargs = get.call_args.kwargs
+        self.assertEqual(kwargs["headers"]["Xero-tenant-id"], "tenant-guid")
+        self.assertEqual(kwargs["headers"]["Authorization"], "Bearer tok")
+        self.assertEqual(kwargs["timeout"], 30)
+
+
 class SaveTokensTest(unittest.TestCase):
     def setUp(self):
         self.dir = tempfile.mkdtemp()
@@ -435,6 +486,50 @@ class SaveTokensTest(unittest.TestCase):
             with self.assertRaises(ValueError):
                 xero_client.save_tokens({"refresh_token": "NEW"})
         self.assertEqual(self._temp_files(), [])
+
+
+class RefreshRejectionTest(unittest.TestCase):
+    """The two everyday refresh failures must read as instructions, not as
+    HTTPError tracebacks out of a scheduled task's log."""
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+        self.token_file = os.path.join(self.dir, "token.json")
+        patcher = mock.patch.object(xero_client, "TOKEN_FILE", self.token_file)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        cached = {
+            "access_token": "OLD-A",
+            "refresh_token": "OLD-R",
+            "expires_in": 1800,
+            "obtained_at": 0.0,
+        }
+        with open(self.token_file, "w") as destination:
+            json.dump(cached, destination)
+        with open(self.token_file, "rb") as source:
+            self.before = source.read()
+
+    def _refresh(self, response):
+        with mock.patch.object(xero_client.time, "time", return_value=10_000.0), \
+                mock.patch.object(xero_client.requests, "post", return_value=response):
+            with self.assertRaises(SystemExit) as ctx:
+                xero_client.get_access_token("client", "secret")
+        with open(self.token_file, "rb") as source:
+            self.assertEqual(source.read(), self.before, "the token cache was rewritten")
+        return str(ctx.exception)
+
+    def test_a_spent_refresh_token_says_so_and_points_at_auth(self):
+        message = self._refresh(
+            _Response(400, text='{"error":"invalid_grant"}')
+        )
+        self.assertIn("Refresh token rejected", message)
+        self.assertIn("python auth.py", message)
+
+    def test_a_rejected_client_secret_points_at_the_env_file(self):
+        message = self._refresh(_Response(401, text=""))
+        self.assertIn("XERO_CLIENT_SECRET", message)
+        self.assertIn(".env", message)
+        self.assertNotIn("OLD-R", message)
 
 
 if __name__ == "__main__":

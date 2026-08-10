@@ -1,7 +1,11 @@
+import io
+import os
 import socket
 import threading
 import time
 import unittest
+from contextlib import redirect_stdout
+from unittest import mock
 
 import auth
 from auth import callback_server_config
@@ -259,6 +263,85 @@ class RealCallbackTest(unittest.TestCase):
         self.assertEqual(server.auth_code, "the-code")
         self.assertEqual(server.returned_state, "the-state")
         self.assertIsNone(server.auth_error)
+
+
+class _StubTokenResponse:
+    """Stands in for the token endpoint's answer to the code exchange."""
+
+    def __init__(self, payload):
+        self._payload = payload
+
+    def raise_for_status(self):
+        return None
+
+    def json(self):
+        return self._payload
+
+
+class StateCheckTest(unittest.TestCase):
+    """The state comparison is the CSRF defence on the callback.
+
+    RealCallbackTest proves the handler records whatever state arrives.
+    Nothing exercised main()'s comparison of that value against the one this
+    run generated - and without it, a callback carrying someone else's
+    authorisation code is exchanged and written to token.json, binding this
+    app registration to an org the user never authorised.
+    """
+
+    GENERATED = "state-this-run-generated"
+    TOKENS = {"access_token": "A", "refresh_token": "R", "expires_in": 1800}
+
+    def _run_main(self, returned_state):
+        port = _free_port()
+        env = {
+            "XERO_CLIENT_ID": "id-not-a-secret",
+            "XERO_CLIENT_SECRET": "secret-not-used",
+            "XERO_REDIRECT_URI": f"http://localhost:{port}/callback",
+        }
+
+        def land_the_callback(server, timeout=auth.CALLBACK_TIMEOUT):
+            server.auth_code = "the-code"
+            server.auth_error = None
+            server.returned_state = returned_state
+
+        raised = None
+        with mock.patch.object(auth, "load_dotenv", lambda *a, **k: None), \
+                mock.patch.dict(os.environ, env, clear=False), \
+                mock.patch.object(auth.secrets, "token_urlsafe", return_value=self.GENERATED), \
+                mock.patch.object(auth.webbrowser, "open", return_value=False), \
+                mock.patch.object(auth, "wait_for_callback", side_effect=land_the_callback), \
+                mock.patch.object(
+                    auth.requests, "post",
+                    return_value=_StubTokenResponse(dict(self.TOKENS)),
+                ) as post, \
+                mock.patch.object(auth, "save_tokens") as save_tokens:
+            with redirect_stdout(io.StringIO()):
+                try:
+                    auth.main()
+                except SystemExit as exc:
+                    raised = exc
+        return raised, post, save_tokens
+
+    def test_a_callback_carrying_another_state_is_never_exchanged(self):
+        raised, post, save_tokens = self._run_main("attacker-supplied-state")
+        self.assertIsInstance(raised, SystemExit)
+        self.assertIn("State mismatch", str(raised.code))
+        post.assert_not_called()
+        save_tokens.assert_not_called()
+
+    def test_a_callback_with_no_state_at_all_is_refused(self):
+        raised, post, save_tokens = self._run_main(None)
+        self.assertIsInstance(raised, SystemExit)
+        self.assertIn("State mismatch", str(raised.code))
+        post.assert_not_called()
+        save_tokens.assert_not_called()
+
+    def test_the_matching_state_still_completes_the_exchange(self):
+        raised, post, save_tokens = self._run_main(self.GENERATED)
+        self.assertIsNone(raised, raised)
+        post.assert_called_once()
+        self.assertEqual(post.call_args.kwargs["data"]["code"], "the-code")
+        save_tokens.assert_called_once_with(self.TOKENS)
 
 
 if __name__ == "__main__":

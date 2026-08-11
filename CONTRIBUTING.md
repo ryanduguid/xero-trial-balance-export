@@ -6,7 +6,7 @@ This exporter reads a Xero trial balance and writes a validated CSV. It is read-
 
 - Never commit credentials. The `.gitignore` blocks `.env*` except `.env.example`, plus `token.json`, `*.json`, and every common export extension. Keep `.env.example` to placeholder values.
 - Do not commit an exported trial balance, an account list, or a tenant identifier from a real organisation. Sample data belongs in `samples/`.
-- Token files are written with a restrictive ACL, but the directory ACL is re-inherited on every refresh — do not rely on file permissions alone as the security story.
+- Token files are written with a restrictive ACL, but the directory ACL is re-inherited on every refresh, so do not rely on file permissions alone as the security story.
 
 ## Correctness rules worth preserving
 

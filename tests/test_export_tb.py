@@ -342,6 +342,47 @@ class DecimalMoneyTest(_ExportCase):
         self.assertIn("diff 0.01", out)
         self.assertIsNone(data, "an unbalanced report must not reach disk")
 
+    def test_a_numeric_section_title_does_not_crash_the_export(self):
+        # ROUND 9. flatten_report stores the section Title unvalidated and
+        # main() feeds it to excel_safe. The guard coerced with str(value) but
+        # the concatenation did not, so a numeric-negative Title tripped the
+        # '-' branch and raised TypeError - after the report had been fetched
+        # and the single-use refresh token spent, so the run could not simply
+        # be retried.
+        raised, _out, data = self.run_export(
+            [
+                ("Cash (090)", "100.00", "", "100.00", ""),
+                ("Equity (960)", "", "100.00", "", "100.00"),
+            ],
+            section=-5,
+        )
+        self.assertIsNone(raised)
+        self.assertIsNotNone(data)
+        self.assertIn(b"'-5", data)
+
+    def test_excel_safe_coerces_before_it_concatenates(self):
+        self.assertEqual(export_tb.excel_safe(-5), "'-5")
+        self.assertEqual(export_tb.excel_safe(-5.5), "'-5.5")
+        self.assertEqual(export_tb.excel_safe(12), "12")
+        self.assertEqual(export_tb.excel_safe(None), "None")
+
+    def test_an_amount_too_precise_to_total_exactly_is_refused(self):
+        # ROUND 9. prec was fixed at 50 and justified as covering to_number's
+        # "admitted bound", but to_number bounds the exponent, not the count of
+        # significant digits, so no fixed precision is provably enough and an
+        # unbalanced report could still print "Balance check OK". The totals
+        # now trap Inexact, so a report needing more precision is refused.
+        digits = "1" + "0" * 30 + "." + "0" * 29 + "1"
+        raised, out, data = self.run_export(
+            [
+                ("Cash (090)", digits, "", digits, ""),
+                ("Equity (960)", "", digits, "", digits),
+            ]
+        )
+        self.assertIsInstance(raised, SystemExit)
+        self.assertNotIn("Balance check OK", out)
+        self.assertIsNone(data, "a report that cannot be totalled exactly must not reach disk")
+
     def test_a_vanishing_exponent_is_refused_with_sensible_wording(self):
         with self.assertRaises(SystemExit) as ctx:
             export_tb.to_number("1E-31")

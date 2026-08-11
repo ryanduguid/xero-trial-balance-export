@@ -27,7 +27,7 @@ import tempfile
 import time
 import unicodedata
 from datetime import date
-from decimal import Decimal, InvalidOperation, localcontext
+from decimal import Decimal, Inexact, InvalidOperation, localcontext
 
 import requests
 from dotenv import load_dotenv
@@ -264,12 +264,20 @@ def iso_date(value: str) -> str:
         ) from None
 
 
-def excel_safe(value: str) -> str:
+def excel_safe(value: object) -> str:
     """CSV formula-injection guard, covering OWASP's trigger set: = + - @
     plus tab, CR and LF. Xero account and organisation names are free text
     anyone in the org can edit. A leading apostrophe forces Excel to read
-    the cell as text; everything else passes through untouched."""
-    return "'" + value if str(value)[:1] in ("=", "+", "-", "@", "\t", "\r", "\n") else value
+    the cell as text; everything else passes through untouched.
+
+    Coerces first. The report's Section title is stored unvalidated, so a
+    numeric one arrived here as an int or float: the guard test coerced but
+    the concatenation did not, and a negative number tripped the '-' branch
+    and raised TypeError. That happened after the report had been fetched and
+    the refresh token spent, so the run could not simply be retried.
+    """
+    text = str(value)
+    return "'" + text if text[:1] in ("=", "+", "-", "@", "\t", "\r", "\n") else text
 
 
 def validated_connections(value: object) -> list[dict]:
@@ -479,17 +487,28 @@ def main() -> None:
         ytd_debit = to_number(record.get("YTD Debit"))
         ytd_credit = to_number(record.get("YTD Credit"))
         # Decimal construction is exact but arithmetic rounds at the context
-        # precision (28 by default). to_number admits cells up to 33
-        # significant digits (MAX_EXPONENT plus cents), so default-context
-        # totals could silently drop a final cent and pass a report that
-        # does not balance. 50 digits covers the admitted bound plus
-        # accumulation headroom.
+        # precision (28 by default), so a default-context total could silently
+        # drop a final cent and pass a report that does not balance.
+        #
+        # A digit count cannot close that on its own: to_number bounds the
+        # exponent, not the significant digits, so no fixed precision is
+        # provably enough. Trapping Inexact makes silent rounding impossible
+        # instead of merely unlikely, and a report that would need more
+        # precision is refused rather than printing "Balance check OK".
         with localcontext() as exact:
-            exact.prec = 50
-            total_debit += debit
-            total_credit += credit
-            total_ytd_debit += ytd_debit
-            total_ytd_credit += ytd_credit
+            exact.prec = 60
+            exact.traps[Inexact] = True
+            try:
+                total_debit += debit
+                total_credit += credit
+                total_ytd_debit += ytd_debit
+                total_ytd_credit += ytd_credit
+            except Inexact:
+                sys.exit(
+                    "Nothing written - a reported amount needs more precision "
+                    "than the balance check can carry exactly, so the totals "
+                    "cannot be trusted. Check the report for a malformed cell."
+                )
 
         out_rows.append(
             {
@@ -520,8 +539,15 @@ def main() -> None:
         ("YTD", total_ytd_debit, total_ytd_credit),
     ):
         with localcontext() as exact:
-            exact.prec = 50
-            diff = debits - credits
+            exact.prec = 60
+            exact.traps[Inexact] = True
+            try:
+                diff = debits - credits
+            except Inexact:
+                sys.exit(
+                    "Nothing written - the {0} difference cannot be computed "
+                    "exactly, so the balance check cannot be trusted.".format(label)
+                )
         if diff != 0:
             print(
                 f"WARNING: {label} debits {debits:,.2f} != credits "

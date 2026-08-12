@@ -725,7 +725,10 @@ class OutputReplaceLockTest(_ExportCase):
             len(leftovers), 1, "the completed export was deleted, not kept"
         )
         tmp_path = os.path.join(self.work_dir, leftovers[0])
-        self.assertIn(tmp_path, message)
+        self.assertIn(
+            os.path.normcase(os.path.realpath(tmp_path)),
+            os.path.normcase(message),
+        )
         with open(tmp_path, "rb") as fh:
             recovered = fh.read()
         self.assertIn(b"Cash", recovered)
@@ -766,7 +769,10 @@ class OutputFsyncFailureTest(_ExportCase):
             len(leftovers), 1, "the completed export was deleted, not kept"
         )
         tmp_path = os.path.join(self.work_dir, leftovers[0])
-        self.assertIn(tmp_path, message)
+        self.assertIn(
+            os.path.normcase(os.path.realpath(tmp_path)),
+            os.path.normcase(message),
+        )
         with open(tmp_path, "rb") as fh:
             recovered = fh.read()
         self.assertIn(b"Cash", recovered)
@@ -1154,6 +1160,11 @@ class AccountCodeTest(unittest.TestCase):
 
     def test_a_code_is_alphanumeric(self):
         for value in ("09-0", "09 0", "090.1", ""):
+            with self.subTest(value=value):
+                self.assertFalse(export_tb.is_account_code(value))
+
+    def test_a_code_uses_the_same_ascii_contract_as_power_query(self):
+        for value in ("Å90", "９０", "١٢٣"):
             with self.subTest(value=value):
                 self.assertFalse(export_tb.is_account_code(value))
 

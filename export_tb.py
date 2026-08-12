@@ -47,7 +47,12 @@ def is_account_code(value: str) -> bool:
     "Rent (Sydney)" keep their parenthetical and export an empty code, which
     is what Xero's code-less bank and credit-card accounts carry anyway.
     """
-    return value.isalnum() and len(value) <= 10 and any(ch.isdigit() for ch in value)
+    return (
+        value.isascii()
+        and value.isalnum()
+        and len(value) <= 10
+        and any(ch.isdigit() for ch in value)
+    )
 
 
 def flatten_report(report: dict) -> tuple[list[str], list[dict]]:

@@ -111,7 +111,7 @@ class ReleaseWorkflowTests(unittest.TestCase):
             "- name: Create, verify and publish the complete release"
         )[2]
         create = publication.index('gh release create "$TAG" dist/*')
-        lookup = publication.index("draft_release_ids=")
+        lookup = publication.index("tools/find_draft_release.py")
         draft_verify = publication.index("/tmp/draft-release.json")
         asset_verify = publication.index("The draft release does not contain the exact asset set")
         digest_verify = publication.index("/tmp/draft-digests")

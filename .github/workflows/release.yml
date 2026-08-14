@@ -3,7 +3,7 @@ name: Release
 on:
   push:
     tags:
-      - "v*"
+      - "v*.*.*"
 
 permissions:
   contents: read
@@ -40,17 +40,36 @@ jobs:
         run: |
           set -euo pipefail
           version="$(tr -d '[:space:]' < VERSION)"
+          if [[ ! "$GITHUB_REF_NAME" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+            echo "Release tags must use canonical vMAJOR.MINOR.PATCH form." >&2
+            exit 1
+          fi
           test "$GITHUB_REF_NAME" = "v$version"
           test "$(git cat-file -t "refs/tags/$GITHUB_REF_NAME")" = tag
           test "$(git rev-parse "refs/tags/$GITHUB_REF_NAME^{commit}")" = "$GITHUB_SHA"
-          git fetch --no-tags origin main
-          test "$(git rev-parse origin/main)" = "$GITHUB_SHA"
+          main_commit="$(gh api \
+            -H "X-GitHub-Api-Version: 2026-03-10" \
+            "repos/$GITHUB_REPOSITORY/git/ref/heads/main" \
+            --jq '.object.sha')"
+          test "$main_commit" = "$GITHUB_SHA"
           test "$(sed -n '1p' RELEASE_NOTES.md)" = "# $GITHUB_REF_NAME"
-          echo "version=$version" >> "$GITHUB_OUTPUT"
-          if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+          existing_release_ids="$(gh api --paginate \
+            -H "X-GitHub-Api-Version: 2026-03-10" \
+            "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
+            --jq ".[] | select(.tag_name == \"$GITHUB_REF_NAME\") | .id")"
+          if [[ -n "$existing_release_ids" ]]; then
             echo "A release for $GITHUB_REF_NAME already exists; refusing to overwrite it." >&2
             exit 1
           fi
+          if [[ -n "$(git status --porcelain --untracked-files=no)" ]]; then
+            echo "The checked-out tracked tree is not clean." >&2
+            exit 1
+          fi
+          {
+            echo "version=$version"
+            echo "tag=$GITHUB_REF_NAME"
+            echo "commit=$GITHUB_SHA"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Install hash-locked dependencies
         run: python -m pip install --require-hashes --requirement requirements.lock
@@ -100,10 +119,140 @@ jobs:
           subject-path: dist/xero-trial-balance-export-${{ steps.release.outputs.version }}.zip
           sbom-path: dist/xero-trial-balance-export-${{ steps.release.outputs.version }}.spdx.json
 
-      - name: Publish the complete release
+      - name: Re-check the remote tag and main immediately before publication
+        env:
+          EXPECTED_COMMIT: ${{ steps.release.outputs.commit }}
+          TAG: ${{ steps.release.outputs.tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          remote_tag_commit="$(git ls-remote \
+            "https://github.com/$GITHUB_REPOSITORY.git" \
+            "refs/tags/$TAG^{}" | cut -f1)"
+          remote_main_commit="$(gh api \
+            -H "X-GitHub-Api-Version: 2026-03-10" \
+            "repos/$GITHUB_REPOSITORY/git/ref/heads/main" \
+            --jq '.object.sha')"
+          test -n "$remote_tag_commit"
+          test "$remote_tag_commit" = "$EXPECTED_COMMIT"
+          test "$remote_main_commit" = "$EXPECTED_COMMIT"
+          test "$GITHUB_SHA" = "$EXPECTED_COMMIT"
+
+      - name: Create, verify and publish the complete release
         env:
           GH_TOKEN: ${{ github.token }}
+          EXPECTED_COMMIT: ${{ steps.release.outputs.commit }}
+          TAG: ${{ steps.release.outputs.tag }}
+        shell: bash
         run: |
-          gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --verify-tag --draft --title "$GITHUB_REF_NAME" --notes-file RELEASE_NOTES.md
-          gh release upload "$GITHUB_REF_NAME" dist/* --repo "$GITHUB_REPOSITORY"
-          gh release edit "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --draft=false --latest
+          set -euo pipefail
+          gh release create "$TAG" dist/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --verify-tag \
+            --draft \
+            --latest \
+            --title "$TAG" \
+            --notes-file RELEASE_NOTES.md
+
+          draft_release_ids="$(gh api --paginate \
+            -H "X-GitHub-Api-Version: 2026-03-10" \
+            "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
+            --jq ".[] | select(.tag_name == \"$TAG\" and .draft == true) | .id")"
+          if [[ ! "$draft_release_ids" =~ ^[0-9]+$ ]]; then
+            echo "Could not identify exactly one draft release for $TAG." >&2
+            exit 1
+          fi
+          release_id="$draft_release_ids"
+          gh api \
+            -H "X-GitHub-Api-Version: 2026-03-10" \
+            "repos/$GITHUB_REPOSITORY/releases/$release_id" \
+            > /tmp/draft-release.json
+          jq -e --arg tag "$TAG" \
+            '.draft == true and .tag_name == $tag and .name == $tag' \
+            /tmp/draft-release.json >/dev/null
+          jq -j '.body' /tmp/draft-release.json > /tmp/draft-release-notes
+          diff -u RELEASE_NOTES.md /tmp/draft-release-notes
+
+          expected_assets="$(find dist -maxdepth 1 -type f -printf '%f\n' | LC_ALL=C sort)"
+          actual_assets="$(jq -r '.assets[].name' /tmp/draft-release.json | LC_ALL=C sort)"
+          if [[ "$actual_assets" != "$expected_assets" ]]; then
+            echo "The draft release does not contain the exact asset set." >&2
+            printf 'Expected:\n%s\nActual:\n%s\n' "$expected_assets" "$actual_assets" >&2
+            exit 1
+          fi
+          (
+            cd dist
+            for file in *; do
+              printf '%s\tsha256:%s\n' "$file" "$(sha256sum "$file" | cut -d' ' -f1)"
+            done
+          ) | LC_ALL=C sort > /tmp/expected-digests
+          jq -r '.assets[] | [.name, .digest] | @tsv' /tmp/draft-release.json \
+            | LC_ALL=C sort > /tmp/draft-digests
+          diff -u /tmp/expected-digests /tmp/draft-digests
+
+          remote_tag_commit="$(git ls-remote \
+            "https://github.com/$GITHUB_REPOSITORY.git" \
+            "refs/tags/$TAG^{}" | cut -f1)"
+          remote_main_commit="$(gh api \
+            -H "X-GitHub-Api-Version: 2026-03-10" \
+            "repos/$GITHUB_REPOSITORY/git/ref/heads/main" \
+            --jq '.object.sha')"
+          test "$remote_tag_commit" = "$EXPECTED_COMMIT"
+          test "$remote_main_commit" = "$EXPECTED_COMMIT"
+          test "$GITHUB_SHA" = "$EXPECTED_COMMIT"
+
+          gh api --method PATCH \
+            -H "X-GitHub-Api-Version: 2026-03-10" \
+            "repos/$GITHUB_REPOSITORY/releases/$release_id" \
+            -F draft=false \
+            -f make_latest=true \
+            >/dev/null
+
+          gh api \
+            -H "X-GitHub-Api-Version: 2026-03-10" \
+            "repos/$GITHUB_REPOSITORY/releases/$release_id" \
+            > /tmp/published-release.json
+          jq -e --arg tag "$TAG" \
+            '.draft == false and .prerelease == false and .immutable == true
+             and .tag_name == $tag and .name == $tag' \
+            /tmp/published-release.json >/dev/null
+          jq -j '.body' /tmp/published-release.json > /tmp/published-release-notes
+          diff -u RELEASE_NOTES.md /tmp/published-release-notes
+          jq -r '.assets[] | [.name, .digest] | @tsv' /tmp/published-release.json \
+            | LC_ALL=C sort > /tmp/published-digests
+          diff -u /tmp/expected-digests /tmp/published-digests
+          gh release list --repo "$GITHUB_REPOSITORY" --limit 100 \
+            --json tagName,isLatest > /tmp/release-list.json
+          jq -e --arg tag "$TAG" \
+            'any(.[]; .tagName == $tag and .isLatest == true)' \
+            /tmp/release-list.json >/dev/null
+          published_tag_commit="$(git ls-remote \
+            "https://github.com/$GITHUB_REPOSITORY.git" \
+            "refs/tags/$TAG^{}" | cut -f1)"
+          published_main_commit="$(gh api \
+            -H "X-GitHub-Api-Version: 2026-03-10" \
+            "repos/$GITHUB_REPOSITORY/git/ref/heads/main" \
+            --jq '.object.sha')"
+          test "$published_tag_commit" = "$EXPECTED_COMMIT"
+          test "$published_main_commit" = "$EXPECTED_COMMIT"
+
+          release_verified=false
+          for attempt in 1 2 3 4 5; do
+            if gh release verify "$TAG" --repo "$GITHUB_REPOSITORY"; then
+              release_verified=true
+              break
+            fi
+            sleep 5
+          done
+          test "$release_verified" = true
+          for file in dist/*; do
+            asset_verified=false
+            for attempt in 1 2 3 4 5; do
+              if gh release verify-asset "$TAG" "$file" --repo "$GITHUB_REPOSITORY"; then
+                asset_verified=true
+                break
+              fi
+              sleep 5
+            done
+            test "$asset_verified" = true
+          done

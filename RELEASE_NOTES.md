@@ -1,10 +1,10 @@
-# v0.1.1
+# v0.1.2
 
-Changes since `v0.1.0`:
+Changes since `v0.1.1`:
 
-- coerce report values before formula-injection checks and refuse totals that cannot be represented exactly;
-- align account-code parsing across report layouts and supported Python/Windows CI legs;
-- serialise token-cache refresh and persistence so concurrent processes do not spend the same rotating refresh token; and
-- add workflow-built source archives, SHA-256 checksums, an SPDX SBOM and GitHub build attestations.
+- protect the complete Windows token cache at rest with current-user DPAPI and forbid any encryption or decryption UI;
+- migrate a valid legacy plaintext Windows cache atomically, under the existing cross-process lock, before any Xero request;
+- reject corrupt, malformed or unknown-version cache envelopes without a network call or rewrite; and
+- retain the explicit non-Windows compatibility fallback as plaintext JSON with owner-only `0600` permissions.
 
-The release contains source and fabricated samples only. It contains no Xero credentials, tokens or client exports and remains read-only against Xero.
+Current-user DPAPI is a same-user, same-machine control. It does not protect tokens from code already running as that user, an administrator controlling the machine, or a compromised user session, and it is not a portable cache format. The release contains source and fabricated samples only. It contains no Xero credentials, tokens or client exports and remains read-only against Xero.

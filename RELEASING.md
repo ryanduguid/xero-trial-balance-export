@@ -16,7 +16,7 @@ Before tagging:
 4. Confirm `VERSION` and the first line of `RELEASE_NOTES.md` match the intended tag.
 5. Create an annotated tag on current remote `main`, for example `git tag -a v0.1.1 -m "v0.1.1"` (or `-s` when signing is configured), then push only that tag.
 
-The workflow installs the hash-locked dependencies, runs the full offline suite and builds deterministic ZIP and tar.gz source archives. It adds an SPDX 2.3 SBOM, `SHA256SUMS`, GitHub provenance and an SBOM attestation before publishing the completed draft. Existing releases are refused rather than overwritten.
+The workflow installs the hash-locked dependencies, runs the full offline suite and builds deterministic ZIP and tar.gz source archives. The archive helper fixes the timezone to UTC and Git text conversion to LF so the same tagged tree produces the same archive bytes on Linux and Windows. It adds an SPDX 2.3 SBOM, `SHA256SUMS`, GitHub provenance and an SBOM attestation before publishing the completed draft. Existing releases are refused rather than overwritten.
 
 Verify the downloaded release with:
 

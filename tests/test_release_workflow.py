@@ -17,10 +17,12 @@ FULL_SHA_REFERENCE = re.compile(r"^[^@]+@[0-9a-f]{40}$")
 
 
 class ReleaseWorkflowTests(unittest.TestCase):
-    def test_release_metadata_is_exactly_v012(self) -> None:
-        self.assertEqual("0.1.2\n", (ROOT / "VERSION").read_text(encoding="utf-8"))
+    def test_release_metadata_is_exactly_v013(self) -> None:
+        self.assertEqual("0.1.3\n", (ROOT / "VERSION").read_text(encoding="utf-8"))
         notes = RELEASE_NOTES.read_text(encoding="utf-8")
-        self.assertTrue(notes.startswith("# v0.1.2\n\nChanges since `v0.1.1`:"))
+        self.assertTrue(
+            notes.startswith("# v0.1.3\n\nChanges since published `v0.1.1`:")
+        )
 
     def test_notes_record_dpapi_and_plaintext_fallback_boundaries(self) -> None:
         notes = " ".join(RELEASE_NOTES.read_text(encoding="utf-8").split())
@@ -38,6 +40,34 @@ class ReleaseWorkflowTests(unittest.TestCase):
         ):
             with self.subTest(phrase=phrase):
                 self.assertIn(phrase, notes)
+
+    def test_notes_preserve_the_failed_v012_release_lineage(self) -> None:
+        notes = " ".join(RELEASE_NOTES.read_text(encoding="utf-8").split())
+        for phrase in (
+            "`v0.1.2` tag",
+            "bd4cd417b06fb9dba3d6b36fbedbe544b1e0fec7",
+            "workflow run 31832080223",
+            "stopped before draft creation",
+            "No v0.1.2 GitHub release or draft was created",
+            "must never be moved, deleted or reused",
+            "v0.1.3 is the recovery release",
+        ):
+            with self.subTest(phrase=phrase):
+                self.assertIn(phrase.lower(), notes.lower())
+
+    def test_every_step_that_invokes_gh_receives_the_scoped_token(self) -> None:
+        workflow = RELEASE_WORKFLOW.read_text(encoding="utf-8")
+        step_blocks = re.findall(
+            r"(?ms)^      - name: .*?(?=^      - name: |\Z)", workflow
+        )
+        gh_steps = [block for block in step_blocks if re.search(r"\bgh\s+", block)]
+        self.assertEqual(3, len(gh_steps))
+        for block in gh_steps:
+            name = block.splitlines()[0].removeprefix("      - name: ")
+            with self.subTest(step=name):
+                metadata, separator, _ = block.partition("        run:")
+                self.assertTrue(separator, f"{name} has no run block")
+                self.assertIn("GH_TOKEN: ${{ github.token }}", metadata)
 
     def test_every_external_action_is_pinned_to_a_full_commit_sha(self) -> None:
         references: list[tuple[str, str]] = []
@@ -126,8 +156,8 @@ class ReleaseWorkflowTests(unittest.TestCase):
 
     def test_operator_process_documents_strong_consumer_verification(self) -> None:
         process = RELEASE_PROCEDURE.read_text(encoding="utf-8")
-        self.assertIn("v0.1.2", process)
-        self.assertNotIn("v0.1.1", process)
+        self.assertIn("tag=v0.1.3", process)
+        self.assertNotIn("tag=v0.1.2", process)
         self.assertIn("Protect version tags", process)
         self.assertIn("/rulesets", process)
         self.assertIn("bypass_actors", process)
@@ -139,6 +169,11 @@ class ReleaseWorkflowTests(unittest.TestCase):
         self.assertIn('--source-ref "refs/tags/$tag"', process)
         self.assertIn("--signer-workflow", process)
         self.assertIn("--predicate-type https://spdx.dev/Document/v2.3", process)
+        self.assertIn("Protected v0.1.2 failed tag", process)
+        self.assertIn("run 31832080223", process)
+        self.assertIn("no v0.1.2 release or draft exists", process)
+        self.assertIn("Do not move, delete or reuse `v0.1.2`", process)
+        self.assertIn("`v0.1.3` is the recovery version", process)
 
 
 if __name__ == "__main__":

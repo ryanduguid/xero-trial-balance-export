@@ -121,6 +121,7 @@ jobs:
 
       - name: Re-check the remote tag and main immediately before publication
         env:
+          GH_TOKEN: ${{ github.token }}
           EXPECTED_COMMIT: ${{ steps.release.outputs.commit }}
           TAG: ${{ steps.release.outputs.tag }}
         shell: bash

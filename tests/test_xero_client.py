@@ -1,4 +1,5 @@
 import json
+import multiprocessing
 import os
 import tempfile
 import unittest
@@ -36,6 +37,42 @@ class _NonJsonResponse(_Response):
 
     def json(self):
         raise ValueError("Expecting value: line 1 column 1 (char 0)")
+
+
+def _concurrent_refresh_worker(
+    token_file,
+    worker_started,
+    refresh_started,
+    allow_refresh,
+    post_calls,
+    results,
+):
+    """Run one synthetic refresh in a spawned process."""
+    xero_client.TOKEN_FILE = token_file
+
+    def post(*args, **kwargs):
+        with post_calls.get_lock():
+            post_calls.value += 1
+        refresh_started.set()
+        if not allow_refresh.wait(10):
+            raise RuntimeError("test timed out waiting to finish the refresh")
+        return _Response(
+            200,
+            payload={
+                "access_token": "NEW-A",
+                "refresh_token": "NEW-R",
+                "expires_in": 1800,
+            },
+        )
+
+    xero_client.requests.post = post
+    worker_started.set()
+    try:
+        token = xero_client.get_access_token("client", "secret")
+    except BaseException as exc:
+        results.put(("error", type(exc).__name__))
+    else:
+        results.put(("ok", token))
 
 
 class RetryAfterTests(unittest.TestCase):
@@ -510,6 +547,118 @@ class SaveTokensTest(unittest.TestCase):
             with self.assertRaises(ValueError):
                 xero_client.save_tokens({"refresh_token": "NEW"})
         self.assertEqual(self._temp_files(), [])
+
+
+class TokenCacheConcurrencyTest(unittest.TestCase):
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp_dir.cleanup)
+        self.token_file = os.path.join(self.temp_dir.name, "token.json")
+        with open(self.token_file, "w") as destination:
+            json.dump(
+                {
+                    "access_token": "OLD-A",
+                    "refresh_token": "OLD-R",
+                    "expires_in": 1800,
+                    "obtained_at": 0.0,
+                },
+                destination,
+            )
+
+    def test_lock_timeout_stops_before_the_cache_is_read(self):
+        with open(self.token_file, "rb") as source:
+            before = source.read()
+
+        with mock.patch.object(xero_client, "TOKEN_LOCK_TIMEOUT", 0), \
+                mock.patch.object(xero_client, "_try_token_lock", return_value=False), \
+                mock.patch.object(xero_client, "load_tokens") as load_tokens:
+            with self.assertRaises(SystemExit) as raised:
+                xero_client.get_access_token("client", "secret")
+
+        load_tokens.assert_not_called()
+        self.assertIn("another process held the token cache lock", str(raised.exception))
+        with open(self.token_file, "rb") as source:
+            self.assertEqual(source.read(), before)
+        self.assertFalse(any(name.endswith(".tmp") for name in os.listdir(self.temp_dir.name)))
+
+    def test_concurrent_processes_spend_one_refresh_token(self):
+        """A waiter must re-read the pair written by the lock holder."""
+        context = multiprocessing.get_context("spawn")
+        first_started = context.Event()
+        second_started = context.Event()
+        refresh_started = context.Event()
+        allow_refresh = context.Event()
+        post_calls = context.Value("i", 0)
+        results = context.Queue()
+        first = context.Process(
+            target=_concurrent_refresh_worker,
+            args=(
+                self.token_file,
+                first_started,
+                refresh_started,
+                allow_refresh,
+                post_calls,
+                results,
+            ),
+        )
+        second = context.Process(
+            target=_concurrent_refresh_worker,
+            args=(
+                self.token_file,
+                second_started,
+                refresh_started,
+                allow_refresh,
+                post_calls,
+                results,
+            ),
+        )
+        processes = (first, second)
+
+        try:
+            first.start()
+            self.assertTrue(first_started.wait(10), "first worker did not start")
+            self.assertTrue(refresh_started.wait(10), "first worker did not begin refresh")
+
+            second.start()
+            self.assertTrue(second_started.wait(10), "second worker did not start")
+            second.join(0.5)
+            self.assertTrue(second.is_alive(), "second worker did not wait for the cache lock")
+            with post_calls.get_lock():
+                self.assertEqual(
+                    post_calls.value,
+                    1,
+                    "both processes spent the same cached refresh token",
+                )
+
+            allow_refresh.set()
+            outcomes = [results.get(timeout=10), results.get(timeout=10)]
+            for process in processes:
+                process.join(10)
+
+            self.assertEqual([process.exitcode for process in processes], [0, 0])
+            self.assertEqual(sorted(outcomes), [("ok", "NEW-A"), ("ok", "NEW-A")])
+            with post_calls.get_lock():
+                self.assertEqual(post_calls.value, 1)
+
+            with open(self.token_file) as source:
+                saved = json.load(source)
+            self.assertEqual(saved["refresh_token"], "NEW-R")
+            with open(f"{self.token_file}.lock", "rb") as source:
+                lock_bytes = source.read()
+            self.assertTrue(lock_bytes)
+            self.assertEqual(set(lock_bytes), {0})
+        finally:
+            allow_refresh.set()
+            for process in processes:
+                if process.pid is None:
+                    continue
+                process.join(5)
+                if process.is_alive():
+                    process.terminate()
+                    process.join(5)
+
+            results.close()
+            results.join_thread()
 
 
 class RefreshRejectionTest(unittest.TestCase):

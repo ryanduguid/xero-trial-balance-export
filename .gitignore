@@ -2,6 +2,7 @@
 .env*
 !.env.example
 token.json
+token.json.lock
 *.json
 *.tmp
 *.log

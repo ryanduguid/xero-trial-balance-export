@@ -3,15 +3,17 @@
 Xero refresh tokens are single-use — every refresh returns a NEW refresh
 token, and the old one survives only a 30-minute grace period. A script
 that fails to persist the new refresh token recovers if it reruns inside
-that window and is locked out after it. Two defences here:
+that window and is locked out after it. Three defences here:
 
-1. Tokens are written to disk immediately after every refresh response,
+1. An interprocess lock covers the cache read, refresh and write transaction.
+2. Tokens are written to disk immediately after every refresh response,
    before any API call is made with the new access token.
-2. The write is atomic (temp file + os.replace), so a crash mid-write can't
+3. The write is atomic (temp file + os.replace), so a crash mid-write can't
    leave a corrupt token.json. If the replace itself cannot be completed,
    the temp file holding the new pair is kept and named in the error.
 """
 
+import errno
 import json
 import math
 import os
@@ -19,6 +21,7 @@ import re
 import sys
 import tempfile
 import time
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
 
@@ -52,6 +55,16 @@ TOKEN_CLOCK_SKEW = 300
 REPLACE_ATTEMPTS = 5
 REPLACE_BACKOFF = 0.2
 
+# Refresh is a read/modify/write transaction: two processes that both read the
+# same expiring refresh token can each spend it and then race to replace the
+# cache. A separate, credential-free lock file serialises that transaction.
+# OS-backed locks are released when a process exits, so an interrupted export
+# cannot leave a stale lock behind. The file itself stays in place because
+# unlinking it while another process is waiting can create two independently
+# locked files on POSIX.
+TOKEN_LOCK_TIMEOUT = 90
+TOKEN_LOCK_POLL = 0.1
+
 # 429 backoff bounds. Xero's per-minute limit resets in under a minute, but
 # the daily limit answers with a Retry-After measured in hours. Sleeping on
 # that pins a scheduled export for the rest of the day, so cap the wait and
@@ -71,6 +84,74 @@ RETRY_AFTER_CLAMP = 86400
 # 7) and Unicode digits, so a header the spec does not allow would set a
 # wait the docstring promises to refuse.
 DELTA_SECONDS = re.compile(r"[0-9]+")
+
+
+def _try_token_lock(lock_file) -> bool:
+    """Try to acquire the platform lock without blocking."""
+    lock_file.seek(0)
+    try:
+        if os.name == "nt":
+            import msvcrt
+
+            msvcrt.locking(lock_file.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError as exc:
+        if exc.errno in (errno.EACCES, errno.EAGAIN, errno.EDEADLK):
+            return False
+        raise
+    return True
+
+
+def _release_token_lock(lock_file) -> None:
+    lock_file.seek(0)
+    if os.name == "nt":
+        import msvcrt
+
+        msvcrt.locking(lock_file.fileno(), msvcrt.LK_UNLCK, 1)
+    else:
+        import fcntl
+
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+
+@contextmanager
+def _token_cache_lock():
+    """Hold the cross-process lock for TOKEN_FILE's cache transaction."""
+    lock_path = f"{TOKEN_FILE}.lock"
+    try:
+        lock_file = open(lock_path, "a+b")
+    except OSError as exc:
+        raise SystemExit(
+            f"error: could not open the token cache lock {lock_path} ({exc}); "
+            "token.json was not read or changed."
+        ) from None
+
+    try:
+        # msvcrt locks a byte range. Ensure byte zero exists; this file never
+        # contains token material or any other process data.
+        if os.fstat(lock_file.fileno()).st_size == 0:
+            lock_file.write(b"\0")
+            lock_file.flush()
+
+        deadline = time.monotonic() + TOKEN_LOCK_TIMEOUT
+        while not _try_token_lock(lock_file):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise SystemExit(
+                    f"error: another process held the token cache lock for "
+                    f"{TOKEN_LOCK_TIMEOUT}s; token.json was not read or changed."
+                )
+            time.sleep(min(TOKEN_LOCK_POLL, remaining))
+
+        try:
+            yield
+        finally:
+            _release_token_lock(lock_file)
+    finally:
+        lock_file.close()
 
 
 def _expires_in_is_usable(value: object) -> bool:
@@ -180,6 +261,12 @@ def retry_after_seconds(value: str | None, *, now: datetime | None = None) -> in
 
 
 def save_tokens(token_response: dict) -> None:
+    """Serialise and atomically persist a token endpoint response."""
+    with _token_cache_lock():
+        _save_tokens_unlocked(token_response)
+
+
+def _save_tokens_unlocked(token_response: dict) -> None:
     """Persist a token endpoint response atomically, stamped with obtained_at.
 
     The temp file is deleted only when it holds nothing worth keeping. Once
@@ -261,47 +348,53 @@ def get_access_token(client_id: str, client_secret: str, force: bool = False) ->
 
     force=True skips the local expiry check — for when a cached token looked
     fresh but Xero returned 401 anyway (skewed clock, token.json copied from
-    another machine).
+    another machine). The lock is taken before token.json is read, so a waiter
+    sees a token pair another process has already rotated instead of spending
+    the same single-use refresh token concurrently.
     """
-    tokens = validate_token_response(load_tokens(), label="token.json", cached=True)
-    age = time.time() - tokens["obtained_at"]
-    if not force and -TOKEN_CLOCK_SKEW <= age < tokens["expires_in"] - EXPIRY_MARGIN:
-        return tokens["access_token"]
+    with _token_cache_lock():
+        tokens = validate_token_response(load_tokens(), label="token.json", cached=True)
+        age = time.time() - tokens["obtained_at"]
+        if not force and -TOKEN_CLOCK_SKEW <= age < tokens["expires_in"] - EXPIRY_MARGIN:
+            return tokens["access_token"]
 
-    resp = requests.post(
-        TOKEN_URL,
-        data={
-            "grant_type": "refresh_token",
-            "refresh_token": tokens["refresh_token"],
-        },
-        auth=(client_id, client_secret),
-        timeout=30,
-    )
-    if resp.status_code == 400 and "invalid_grant" in resp.text:
-        raise SystemExit(
-            "Refresh token rejected (already used or expired). "
-            "Re-authorise with: python auth.py"
+        resp = requests.post(
+            TOKEN_URL,
+            data={
+                "grant_type": "refresh_token",
+                "refresh_token": tokens["refresh_token"],
+            },
+            auth=(client_id, client_secret),
+            timeout=30,
         )
-    # A mistyped XERO_CLIENT_SECRET is the other everyday failure here, and
-    # the token endpoint answers it with 401 (OAuth2 invalid_client). Without
-    # this branch raise_for_status printed a bare HTTPError traceback naming
-    # the identity endpoint, which reads as a Xero outage rather than a typo
-    # in .env. The stored refresh token is untouched either way.
-    if resp.status_code == 401:
-        raise SystemExit(
-            "Xero rejected this app's credentials when refreshing the token "
-            "(HTTP 401). Check XERO_CLIENT_ID and XERO_CLIENT_SECRET in .env "
-            "against the app at developer.xero.com; token.json was left "
-            "as it was."
-        )
-    resp.raise_for_status()
-    try:
-        new_tokens = resp.json()
-    except ValueError:
-        raise SystemExit("error: Xero returned a non-JSON token response; the existing token cache was left untouched.") from None
-    new_tokens = validate_rotated_response(new_tokens)
-    save_tokens(new_tokens)  # persist BEFORE using — rotation safety
-    return new_tokens["access_token"]
+        if resp.status_code == 400 and "invalid_grant" in resp.text:
+            raise SystemExit(
+                "Refresh token rejected (already used or expired). "
+                "Re-authorise with: python auth.py"
+            )
+        # A mistyped XERO_CLIENT_SECRET is the other everyday failure here, and
+        # the token endpoint answers it with 401 (OAuth2 invalid_client). Without
+        # this branch raise_for_status printed a bare HTTPError traceback naming
+        # the identity endpoint, which reads as a Xero outage rather than a typo
+        # in .env. The stored refresh token is untouched either way.
+        if resp.status_code == 401:
+            raise SystemExit(
+                "Xero rejected this app's credentials when refreshing the token "
+                "(HTTP 401). Check XERO_CLIENT_ID and XERO_CLIENT_SECRET in .env "
+                "against the app at developer.xero.com; token.json was left "
+                "as it was."
+            )
+        resp.raise_for_status()
+        try:
+            new_tokens = resp.json()
+        except ValueError:
+            raise SystemExit(
+                "error: Xero returned a non-JSON token response; the existing "
+                "token cache was left untouched."
+            ) from None
+        new_tokens = validate_rotated_response(new_tokens)
+        _save_tokens_unlocked(new_tokens)  # persist BEFORE using — rotation safety
+        return new_tokens["access_token"]
 
 
 def api_get(

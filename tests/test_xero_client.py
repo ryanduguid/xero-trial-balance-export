@@ -1,6 +1,7 @@
 import json
 import multiprocessing
 import os
+import stat
 import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
@@ -367,6 +368,10 @@ class SaveTokensTest(unittest.TestCase):
     def _temp_files(self):
         return sorted(f for f in os.listdir(self.dir) if f.endswith(".tmp"))
 
+    def _read_cache(self, path=None):
+        with open(path or self.token_file, "rb") as source:
+            return xero_client._decode_token_cache(source.read())[0]
+
     def _write_cache(self):
         cached = {
             "access_token": "OLD-A",
@@ -374,8 +379,7 @@ class SaveTokensTest(unittest.TestCase):
             "expires_in": 1800,
             "obtained_at": 0.0,
         }
-        with open(self.token_file, "w") as destination:
-            json.dump(cached, destination)
+        xero_client._persist_token_cache_unlocked(cached, legacy_migration=False)
         with open(self.token_file, "rb") as source:
             return source.read()
 
@@ -406,8 +410,7 @@ class SaveTokensTest(unittest.TestCase):
                         mock.patch.object(xero_client.requests, "post", return_value=response):
                     access_token = xero_client.get_access_token("client", "secret")
                 self.assertEqual(access_token, "NEW-A")
-                with open(self.token_file) as source:
-                    saved = json.load(source)
+                saved = self._read_cache()
                 self.assertEqual(saved["refresh_token"], "NEW-R")
                 self.assertEqual(saved["expires_in"], xero_client.DEFAULT_EXPIRES_IN)
 
@@ -450,15 +453,13 @@ class SaveTokensTest(unittest.TestCase):
 
         self.assertEqual(access_token, "NEW-A")
         post.assert_called_once()
-        with open(self.token_file) as source:
-            saved = json.load(source)
+        saved = self._read_cache()
         self.assertEqual(saved["refresh_token"], "NEW-R")
         self.assertEqual(saved["obtained_at"], 1_000.0)
 
     def test_success_writes_token_file_and_leaves_no_temp(self):
         xero_client.save_tokens({"refresh_token": "NEW", "access_token": "A"})
-        with open(self.token_file) as fh:
-            saved = json.load(fh)
+        saved = self._read_cache()
         self.assertEqual(saved["refresh_token"], "NEW")
         self.assertIn("obtained_at", saved)
         self.assertEqual(self._temp_files(), [])
@@ -482,8 +483,7 @@ class SaveTokensTest(unittest.TestCase):
             [c.args[0] for c in sleep.call_args_list],
             [xero_client.REPLACE_BACKOFF * 1, xero_client.REPLACE_BACKOFF * 2],
         )
-        with open(self.token_file) as fh:
-            self.assertEqual(json.load(fh)["refresh_token"], "NEW")
+        self.assertEqual(self._read_cache()["refresh_token"], "NEW")
         self.assertEqual(self._temp_files(), [])
 
     def test_permanent_replace_failure_keeps_the_new_token_on_disk(self):
@@ -502,8 +502,7 @@ class SaveTokensTest(unittest.TestCase):
             len(leftovers), 1, "the only copy of the new refresh token was deleted"
         )
         tmp_path = os.path.join(self.dir, leftovers[0])
-        with open(tmp_path) as fh:
-            self.assertEqual(json.load(fh)["refresh_token"], "NEW")
+        self.assertEqual(self._read_cache(tmp_path)["refresh_token"], "NEW")
         # token.json must be left holding the old pair, untouched.
         with open(self.token_file) as fh:
             self.assertEqual(json.load(fh)["refresh_token"], "OLD-CONSUMED")
@@ -531,8 +530,7 @@ class SaveTokensTest(unittest.TestCase):
             len(leftovers), 1, "the only copy of the new refresh token was deleted"
         )
         tmp_path = os.path.join(self.dir, leftovers[0])
-        with open(tmp_path) as fh:
-            self.assertEqual(json.load(fh)["refresh_token"], "NEW")
+        self.assertEqual(self._read_cache(tmp_path)["refresh_token"], "NEW")
         with open(self.token_file) as fh:
             self.assertEqual(json.load(fh)["refresh_token"], "OLD-CONSUMED")
         self.assertTrue(message.startswith("error: "), message)
@@ -542,11 +540,244 @@ class SaveTokensTest(unittest.TestCase):
 
     def test_a_half_written_temp_file_is_cleaned_up(self):
         with mock.patch.object(
-            xero_client.json, "dump", side_effect=ValueError("boom")
+            xero_client.json, "dumps", side_effect=ValueError("boom")
         ):
             with self.assertRaises(ValueError):
                 xero_client.save_tokens({"refresh_token": "NEW"})
         self.assertEqual(self._temp_files(), [])
+
+
+class TokenCacheProtectionTest(unittest.TestCase):
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp_dir.cleanup)
+        self.token_file = os.path.join(self.temp_dir.name, "token.json")
+        patcher = mock.patch.object(xero_client, "TOKEN_FILE", self.token_file)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.tokens = {
+            "access_token": "SYNTHETIC-ACCESS-UNIQUE-2904",
+            "refresh_token": "SYNTHETIC-REFRESH-UNIQUE-8173",
+            "expires_in": 1800,
+            "obtained_at": 1_000.25,
+        }
+
+    def _write_legacy(self):
+        raw = json.dumps(self.tokens).encode("utf-8")
+        with open(self.token_file, "wb") as destination:
+            destination.write(raw)
+        return raw
+
+    def _raw(self, path=None):
+        with open(path or self.token_file, "rb") as source:
+            return source.read()
+
+    @unittest.skipUnless(os.name == "nt", "requires real Windows DPAPI")
+    def test_real_dpapi_round_trip_and_wrong_payloads_fail_closed(self):
+        plaintext = b"synthetic-dpapi-round-trip-4591"
+        protected = xero_client._dpapi_protect(plaintext)
+        self.assertNotEqual(protected, plaintext)
+        self.assertNotIn(plaintext, protected)
+        self.assertEqual(xero_client._dpapi_unprotect(protected), plaintext)
+
+        mutated = bytearray(protected)
+        mutated[-1] ^= 0x01
+        for wrong in (b"not-a-dpapi-payload", bytes(mutated)):
+            with self.subTest(length=len(wrong)), self.assertRaises(SystemExit) as raised:
+                xero_client._dpapi_unprotect(wrong)
+            self.assertIn("corrupt or cannot be opened", str(raised.exception))
+
+    @unittest.skipUnless(os.name == "nt", "Windows cache is DPAPI-protected")
+    def test_windows_cache_and_recovery_temp_never_hold_plaintext_tokens(self):
+        xero_client._persist_token_cache_unlocked(
+            self.tokens, legacy_migration=False
+        )
+        raw = self._raw()
+        self.assertNotIn(self.tokens["access_token"].encode(), raw)
+        self.assertNotIn(self.tokens["refresh_token"].encode(), raw)
+        envelope = json.loads(raw)
+        self.assertEqual(envelope["format"], xero_client.TOKEN_CACHE_FORMAT)
+        self.assertEqual(envelope["version"], xero_client.TOKEN_CACHE_VERSION)
+        self.assertEqual(envelope["protection"], xero_client.TOKEN_CACHE_PROTECTION)
+
+        old_raw = raw
+        replacement = dict(self.tokens)
+        replacement["access_token"] = "SYNTHETIC-REPLACEMENT-ACCESS-6428"
+        replacement["refresh_token"] = "SYNTHETIC-REPLACEMENT-REFRESH-1736"
+        with mock.patch.object(
+            xero_client.os,
+            "replace",
+            side_effect=PermissionError(32, "destination is held"),
+        ), mock.patch.object(xero_client.time, "sleep"):
+            with self.assertRaises(SystemExit):
+                xero_client._persist_token_cache_unlocked(
+                    replacement, legacy_migration=False
+                )
+
+        self.assertEqual(self._raw(), old_raw)
+        temps = [
+            os.path.join(self.temp_dir.name, name)
+            for name in os.listdir(self.temp_dir.name)
+            if name.endswith(".tmp")
+        ]
+        self.assertEqual(len(temps), 1)
+        temp_raw = self._raw(temps[0])
+        for value in (
+            self.tokens["access_token"],
+            self.tokens["refresh_token"],
+            replacement["access_token"],
+            replacement["refresh_token"],
+        ):
+            self.assertNotIn(value.encode(), temp_raw)
+        decoded, legacy = xero_client._decode_token_cache(temp_raw)
+        self.assertFalse(legacy)
+        self.assertEqual(decoded, replacement)
+
+    @unittest.skipUnless(os.name == "nt", "legacy migration targets Windows")
+    def test_valid_legacy_cache_migrates_before_any_network_call(self):
+        original_obtained_at = self.tokens["obtained_at"]
+        legacy_raw = self._write_legacy()
+
+        with mock.patch.object(xero_client.time, "time", return_value=1_100.0), \
+                mock.patch.object(xero_client.requests, "post") as post:
+            access_token = xero_client.get_access_token("client", "secret")
+
+        self.assertEqual(access_token, self.tokens["access_token"])
+        post.assert_not_called()
+        migrated = self._raw()
+        self.assertNotEqual(migrated, legacy_raw)
+        self.assertNotIn(self.tokens["access_token"].encode(), migrated)
+        self.assertNotIn(self.tokens["refresh_token"].encode(), migrated)
+        decoded, legacy = xero_client._decode_token_cache(migrated)
+        self.assertFalse(legacy)
+        self.assertEqual(decoded["obtained_at"], original_obtained_at)
+        self.assertEqual(decoded, self.tokens)
+
+    @unittest.skipUnless(os.name == "nt", "legacy migration targets Windows")
+    def test_failed_legacy_migration_preserves_source_and_makes_no_request(self):
+        legacy_raw = self._write_legacy()
+        error = PermissionError(32, "destination is held")
+        with mock.patch.object(xero_client.os, "replace", side_effect=error), \
+                mock.patch.object(xero_client.time, "sleep"), \
+                mock.patch.object(xero_client.requests, "post") as post, \
+                self.assertRaises(SystemExit) as raised:
+            xero_client.get_access_token("client", "secret")
+
+        post.assert_not_called()
+        self.assertEqual(self._raw(), legacy_raw)
+        self.assertIn("no Xero request was made", str(raised.exception))
+        temps = [
+            os.path.join(self.temp_dir.name, name)
+            for name in os.listdir(self.temp_dir.name)
+            if name.endswith(".tmp")
+        ]
+        self.assertEqual(len(temps), 1)
+        temp_raw = self._raw(temps[0])
+        self.assertNotIn(self.tokens["access_token"].encode(), temp_raw)
+        self.assertNotIn(self.tokens["refresh_token"].encode(), temp_raw)
+        self.assertEqual(xero_client._decode_token_cache(temp_raw)[0], self.tokens)
+
+    def test_unknown_or_corrupt_envelopes_stop_before_the_network(self):
+        documents = [
+            {
+                "format": xero_client.TOKEN_CACHE_FORMAT,
+                "version": True,
+                "protection": xero_client.TOKEN_CACHE_PROTECTION,
+                "payload": "AA==",
+            },
+            {
+                "format": xero_client.TOKEN_CACHE_FORMAT,
+                "version": 999,
+                "protection": xero_client.TOKEN_CACHE_PROTECTION,
+                "payload": "AA==",
+            },
+            {
+                "format": xero_client.TOKEN_CACHE_FORMAT,
+                "version": xero_client.TOKEN_CACHE_VERSION,
+                "protection": xero_client.TOKEN_CACHE_PROTECTION,
+                "payload": "not base64!",
+            },
+            {
+                "format": xero_client.TOKEN_CACHE_FORMAT,
+                "version": xero_client.TOKEN_CACHE_VERSION,
+                "protection": xero_client.TOKEN_CACHE_PROTECTION,
+                "payload": "AA==",
+                "unexpected": True,
+            },
+        ]
+        for document in documents:
+            with self.subTest(document=document):
+                raw = json.dumps(document).encode("utf-8")
+                with open(self.token_file, "wb") as destination:
+                    destination.write(raw)
+                with mock.patch.object(xero_client.requests, "post") as post, \
+                        self.assertRaises(SystemExit):
+                    xero_client.get_access_token("client", "secret")
+                post.assert_not_called()
+                self.assertEqual(self._raw(), raw)
+
+    def test_a_windows_envelope_is_not_treated_as_plaintext_elsewhere(self):
+        document = {
+            "format": xero_client.TOKEN_CACHE_FORMAT,
+            "version": xero_client.TOKEN_CACHE_VERSION,
+            "protection": xero_client.TOKEN_CACHE_PROTECTION,
+            "payload": "AA==",
+        }
+        with mock.patch.object(xero_client, "_is_windows", return_value=False), \
+                self.assertRaises(SystemExit) as raised:
+            xero_client._decode_token_cache(json.dumps(document).encode("utf-8"))
+        self.assertIn("can only be opened by the Windows user", str(raised.exception))
+
+    @unittest.skipIf(os.name == "nt", "POSIX permission semantics required")
+    def test_posix_plaintext_fallback_is_and_remains_owner_only(self):
+        xero_client._persist_token_cache_unlocked(
+            self.tokens, legacy_migration=False
+        )
+        self.assertEqual(
+            stat.S_IMODE(os.stat(self.token_file).st_mode),
+            stat.S_IRUSR | stat.S_IWUSR,
+        )
+        self.assertIn(self.tokens["access_token"].encode(), self._raw())
+
+        os.chmod(self.token_file, 0o644)
+        self.assertEqual(xero_client.load_tokens(), self.tokens)
+        self.assertEqual(
+            stat.S_IMODE(os.stat(self.token_file).st_mode),
+            stat.S_IRUSR | stat.S_IWUSR,
+        )
+
+    def test_a_partial_temp_write_is_removed(self):
+        real_fdopen = os.fdopen
+
+        class PartialWriter:
+            def __init__(self, fd, mode):
+                self._file = real_fdopen(fd, mode)
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                self._file.close()
+
+            def write(self, value):
+                self._file.write(value[: max(1, len(value) // 2)])
+                raise OSError(5, "synthetic partial write")
+
+            def flush(self):
+                self._file.flush()
+
+            def fileno(self):
+                return self._file.fileno()
+
+        with mock.patch.object(xero_client.os, "fdopen", side_effect=PartialWriter), \
+                self.assertRaises(OSError):
+            xero_client._persist_token_cache_unlocked(
+                self.tokens, legacy_migration=False
+            )
+        self.assertFalse(os.path.exists(self.token_file))
+        self.assertFalse(
+            any(name.endswith(".tmp") for name in os.listdir(self.temp_dir.name))
+        )
 
 
 class TokenCacheConcurrencyTest(unittest.TestCase):
@@ -571,7 +802,7 @@ class TokenCacheConcurrencyTest(unittest.TestCase):
 
         with mock.patch.object(xero_client, "TOKEN_LOCK_TIMEOUT", 0), \
                 mock.patch.object(xero_client, "_try_token_lock", return_value=False), \
-                mock.patch.object(xero_client, "load_tokens") as load_tokens:
+                mock.patch.object(xero_client, "_load_tokens_unlocked") as load_tokens:
             with self.assertRaises(SystemExit) as raised:
                 xero_client.get_access_token("client", "secret")
 
@@ -640,8 +871,8 @@ class TokenCacheConcurrencyTest(unittest.TestCase):
             with post_calls.get_lock():
                 self.assertEqual(post_calls.value, 1)
 
-            with open(self.token_file) as source:
-                saved = json.load(source)
+            with mock.patch.object(xero_client, "TOKEN_FILE", self.token_file):
+                saved = xero_client.load_tokens()
             self.assertEqual(saved["refresh_token"], "NEW-R")
             with open(f"{self.token_file}.lock", "rb") as source:
                 lock_bytes = source.read()
@@ -677,8 +908,7 @@ class RefreshRejectionTest(unittest.TestCase):
             "expires_in": 1800,
             "obtained_at": 0.0,
         }
-        with open(self.token_file, "w") as destination:
-            json.dump(cached, destination)
+        xero_client._persist_token_cache_unlocked(cached, legacy_migration=False)
         with open(self.token_file, "rb") as source:
             self.before = source.read()
 

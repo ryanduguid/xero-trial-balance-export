@@ -13,14 +13,19 @@ that window and is locked out after it. Three defences here:
    the temp file holding the new pair is kept and named in the error.
 """
 
+import base64
+import binascii
+import ctypes
 import errno
 import json
 import math
 import os
 import re
+import stat
 import sys
 import tempfile
 import time
+from ctypes import wintypes
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
@@ -30,6 +35,18 @@ import requests
 TOKEN_URL = "https://identity.xero.com/connect/token"
 CONNECTIONS_URL = "https://api.xero.com/connections"
 TOKEN_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "token.json")
+
+# Windows token caches are JSON envelopes whose payload is protected for the
+# current Windows user by DPAPI.  Keep these values explicit: a future format
+# change must be handled as a migration, never guessed from ciphertext.
+TOKEN_CACHE_FORMAT = "xero-trial-balance-export-token-cache"
+TOKEN_CACHE_VERSION = 1
+TOKEN_CACHE_PROTECTION = "windows-dpapi-current-user"
+TOKEN_CACHE_ENVELOPE_KEYS = {"format", "version", "protection", "payload"}
+
+# Suppress any DPAPI prompt.  A scheduled export has no safe way to answer a
+# UI dialog and must fail closed instead.
+CRYPTPROTECT_UI_FORBIDDEN = 0x1
 
 # Refresh this many seconds before the access token's stated expiry.
 EXPIRY_MARGIN = 60
@@ -84,6 +101,200 @@ RETRY_AFTER_CLAMP = 86400
 # 7) and Unicode digits, so a header the spec does not allow would set a
 # wait the docstring promises to refuse.
 DELTA_SECONDS = re.compile(r"[0-9]+")
+
+
+class _DataBlob(ctypes.Structure):
+    """Windows DATA_BLOB used by CryptProtectData/CryptUnprotectData."""
+
+    _fields_ = [
+        ("cbData", wintypes.DWORD),
+        ("pbData", ctypes.POINTER(ctypes.c_ubyte)),
+    ]
+
+
+def _is_windows() -> bool:
+    """Small seam for exercising the documented POSIX fallback in tests."""
+    return os.name == "nt"
+
+
+def _windows_dpapi(function_name: str, data: bytes) -> bytes:
+    """Call a current-user DPAPI function without optional entropy or UI."""
+    if not _is_windows():
+        raise SystemExit(
+            "error: Windows DPAPI is unavailable on this platform; "
+            "token.json was not changed."
+        )
+
+    input_buffer = ctypes.create_string_buffer(data, len(data))
+    input_blob = _DataBlob(
+        len(data), ctypes.cast(input_buffer, ctypes.POINTER(ctypes.c_ubyte))
+    )
+    output_blob = _DataBlob()
+
+    crypt32 = ctypes.WinDLL("crypt32", use_last_error=True)
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    function = getattr(crypt32, function_name)
+    function.argtypes = [
+        ctypes.POINTER(_DataBlob),
+        wintypes.LPCWSTR if function_name == "CryptProtectData" else ctypes.c_void_p,
+        ctypes.POINTER(_DataBlob),
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        wintypes.DWORD,
+        ctypes.POINTER(_DataBlob),
+    ]
+    function.restype = wintypes.BOOL
+    kernel32.LocalFree.argtypes = [ctypes.c_void_p]
+    kernel32.LocalFree.restype = ctypes.c_void_p
+
+    # CryptProtectData's second argument is an optional description.  The
+    # corresponding CryptUnprotectData slot is a pointer-to-pointer output;
+    # passing None declines it in either case.
+    if not function(
+        ctypes.byref(input_blob),
+        None,
+        None,
+        None,
+        None,
+        CRYPTPROTECT_UI_FORBIDDEN,
+        ctypes.byref(output_blob),
+    ):
+        error = ctypes.get_last_error()
+        if function_name == "CryptUnprotectData":
+            raise SystemExit(
+                "error: token.json's DPAPI payload is corrupt or cannot be "
+                "opened by this Windows user; the file was left unchanged. "
+                "Run: python auth.py"
+            ) from None
+        raise SystemExit(
+            f"error: Windows DPAPI could not protect token.json "
+            f"(Windows error {error}); no token was saved."
+        ) from None
+
+    try:
+        return ctypes.string_at(output_blob.pbData, output_blob.cbData)
+    finally:
+        if output_blob.pbData:
+            kernel32.LocalFree(ctypes.cast(output_blob.pbData, ctypes.c_void_p))
+
+
+def _dpapi_protect(data: bytes) -> bytes:
+    return _windows_dpapi("CryptProtectData", data)
+
+
+def _dpapi_unprotect(data: bytes) -> bytes:
+    return _windows_dpapi("CryptUnprotectData", data)
+
+
+def _reject_duplicate_keys(pairs: list[tuple[str, object]]) -> dict:
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f"duplicate JSON key: {key}")
+        result[key] = value
+    return result
+
+
+def _parse_json_document(raw: bytes, *, label: str) -> object:
+    try:
+        text = raw.decode("utf-8")
+        return json.loads(text, object_pairs_hook=_reject_duplicate_keys)
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
+        raise SystemExit(
+            f"error: {label} is unreadable or corrupt; the file was left "
+            "unchanged. Run: python auth.py"
+        ) from None
+
+
+def _encode_token_cache(tokens: dict) -> bytes:
+    """Return the complete on-disk document without writing plaintext first."""
+    plaintext = json.dumps(
+        tokens, ensure_ascii=False, separators=(",", ":"), sort_keys=True
+    ).encode("utf-8")
+    if not _is_windows():
+        # DPAPI has no cross-platform equivalent in the standard library.  The
+        # documented fallback remains compatible with existing POSIX installs
+        # and is protected by an owner-only file mode at write/load time.
+        return json.dumps(tokens, ensure_ascii=False, indent=2).encode("utf-8") + b"\n"
+
+    protected = _dpapi_protect(plaintext)
+    envelope = {
+        "format": TOKEN_CACHE_FORMAT,
+        "version": TOKEN_CACHE_VERSION,
+        "protection": TOKEN_CACHE_PROTECTION,
+        "payload": base64.b64encode(protected).decode("ascii"),
+    }
+    return json.dumps(envelope, indent=2).encode("utf-8") + b"\n"
+
+
+def _decode_token_cache(raw: bytes) -> tuple[dict, bool]:
+    """Return ``(tokens, legacy_plaintext)`` from an on-disk document."""
+    document = _parse_json_document(raw, label="token.json")
+    if not isinstance(document, dict):
+        raise SystemExit(
+            "error: token.json is not a JSON object; the file was left "
+            "unchanged. Run: python auth.py"
+        )
+
+    if "format" not in document:
+        return document, True
+
+    if set(document) != TOKEN_CACHE_ENVELOPE_KEYS:
+        raise SystemExit(
+            "error: token.json has an invalid or unknown cache envelope; "
+            "the file was left unchanged. Run: python auth.py"
+        )
+    if (
+        document.get("format") != TOKEN_CACHE_FORMAT
+        or type(document.get("version")) is not int
+        or document["version"] != TOKEN_CACHE_VERSION
+        or document.get("protection") != TOKEN_CACHE_PROTECTION
+        or not isinstance(document.get("payload"), str)
+    ):
+        raise SystemExit(
+            "error: token.json uses an unsupported cache format, version or "
+            "protection method; the file was left unchanged. Run: python auth.py"
+        )
+    if not _is_windows():
+        raise SystemExit(
+            "error: token.json is protected by Windows DPAPI and can only be "
+            "opened by the Windows user who created it; the file was left "
+            "unchanged. Run auth.py under that Windows account."
+        )
+    try:
+        ciphertext = base64.b64decode(document["payload"], validate=True)
+    except (binascii.Error, ValueError):
+        raise SystemExit(
+            "error: token.json has a corrupt DPAPI payload; the file was left "
+            "unchanged. Run: python auth.py"
+        ) from None
+    if not ciphertext:
+        raise SystemExit(
+            "error: token.json has an empty DPAPI payload; the file was left "
+            "unchanged. Run: python auth.py"
+        )
+    tokens = _parse_json_document(
+        _dpapi_unprotect(ciphertext), label="token.json's decrypted payload"
+    )
+    if not isinstance(tokens, dict):
+        raise SystemExit(
+            "error: token.json's decrypted payload is not a JSON object; the "
+            "file was left unchanged. Run: python auth.py"
+        )
+    return tokens, False
+
+
+def _enforce_owner_only(path: str) -> None:
+    """Require mode 0600 for the explicit non-Windows plaintext fallback."""
+    if _is_windows():
+        return
+    try:
+        os.chmod(path, stat.S_IRUSR | stat.S_IWUSR)
+    except (AttributeError, NotImplementedError, OSError) as exc:
+        raise SystemExit(
+            f"error: could not restrict plaintext token cache {path} to mode "
+            f"0600 ({exc}); the cache was not used."
+        ) from None
 
 
 def _try_token_lock(lock_file) -> bool:
@@ -279,11 +490,33 @@ def _save_tokens_unlocked(token_response: dict) -> None:
     """
     data = dict(token_response)
     data["obtained_at"] = time.time()
+    _persist_token_cache_unlocked(data, legacy_migration=False)
+
+
+def _persist_token_cache_unlocked(data: dict, *, legacy_migration: bool) -> None:
+    """Write a complete cache document through the existing atomic path.
+
+    Encoding happens in memory before a temp file exists.  On Windows that
+    means neither the destination nor any recovery temp ever receives the
+    plaintext token pair.  ``legacy_migration`` changes only the recovery
+    message: no refresh token has been spent and the original plaintext cache
+    remains usable until the encrypted replacement succeeds.
+    """
+    encoded = _encode_token_cache(data)
     fd, tmp_path = tempfile.mkstemp(dir=os.path.dirname(TOKEN_FILE), suffix=".tmp")
+    try:
+        _enforce_owner_only(tmp_path)
+    except BaseException:
+        os.close(fd)
+        if os.path.exists(tmp_path):
+            os.unlink(tmp_path)
+        raise
+
     written = False
     try:
-        with os.fdopen(fd, "w") as fh:
-            json.dump(data, fh, indent=2)
+        with os.fdopen(fd, "wb") as fh:
+            if fh.write(encoded) != len(encoded):
+                raise OSError("short write while saving token cache")
             fh.flush()
             # The flush is what makes the file whole, which is all "written"
             # claims. Past this line the temp file holds the complete new
@@ -296,6 +529,13 @@ def _save_tokens_unlocked(token_response: dict) -> None:
             try:
                 os.fsync(fh.fileno())
             except OSError as exc:
+                if legacy_migration:
+                    raise SystemExit(
+                        f"error: wrote an encrypted replacement for the legacy "
+                        f"token cache to {tmp_path} but could not flush it to "
+                        f"disk ({exc}). {TOKEN_FILE} was left unchanged and no "
+                        "Xero request was made. Delete the temp file and retry."
+                    ) from None
                 raise SystemExit(
                     f"error: wrote the new Xero token pair to {tmp_path} but "
                     f"could not flush it to disk ({exc}). {TOKEN_FILE} still "
@@ -315,6 +555,14 @@ def _save_tokens_unlocked(token_response: dict) -> None:
                 if attempt < REPLACE_ATTEMPTS - 1:
                     time.sleep(REPLACE_BACKOFF * (attempt + 1))
 
+        if legacy_migration:
+            raise SystemExit(
+                f"error: wrote an encrypted replacement for the legacy token "
+                f"cache to {tmp_path} but could not move it onto {TOKEN_FILE} "
+                f"after {REPLACE_ATTEMPTS} attempts ({last_error}). The legacy "
+                "cache was left unchanged and no Xero request was made. Delete "
+                "the temp file and retry."
+            )
         raise SystemExit(
             f"error: wrote the new Xero token pair to {tmp_path} but could not "
             f"move it onto {TOKEN_FILE} after {REPLACE_ATTEMPTS} attempts "
@@ -330,17 +578,37 @@ def _save_tokens_unlocked(token_response: dict) -> None:
             os.unlink(tmp_path)
 
 
-def load_tokens() -> dict:
+def _load_tokens_unlocked() -> dict:
     if not os.path.exists(TOKEN_FILE):
         raise SystemExit("No token.json - run: python auth.py")
-    with open(TOKEN_FILE) as fh:
-        try:
-            return json.load(fh)
-        except (json.JSONDecodeError, UnicodeDecodeError):
-            raise SystemExit(
-                "token.json is unreadable or corrupt - delete it and "
-                "run: python auth.py"
-            ) from None
+    try:
+        if not _is_windows():
+            # The explicit fallback is plaintext, so tighten an inherited or
+            # copied mode before any token bytes are read by this process.
+            _enforce_owner_only(TOKEN_FILE)
+        with open(TOKEN_FILE, "rb") as fh:
+            raw = fh.read()
+    except OSError as exc:
+        raise SystemExit(
+            f"error: token.json could not be read ({exc}); the file was left "
+            "unchanged. Run: python auth.py"
+        ) from None
+
+    tokens, legacy_plaintext = _decode_token_cache(raw)
+    validate_token_response(tokens, label="token.json", cached=True)
+    if legacy_plaintext and _is_windows():
+        # The caller holds the same interprocess lock as refresh.  Finish this
+        # atomic rewrite before it is possible to reach requests.post, and do
+        # not restamp obtained_at: migration must not make an old access token
+        # look newly issued.
+        _persist_token_cache_unlocked(tokens, legacy_migration=True)
+    return tokens
+
+
+def load_tokens() -> dict:
+    """Read and validate the cache, serialising any Windows legacy migration."""
+    with _token_cache_lock():
+        return _load_tokens_unlocked()
 
 
 def get_access_token(client_id: str, client_secret: str, force: bool = False) -> str:
@@ -353,7 +621,7 @@ def get_access_token(client_id: str, client_secret: str, force: bool = False) ->
     the same single-use refresh token concurrently.
     """
     with _token_cache_lock():
-        tokens = validate_token_response(load_tokens(), label="token.json", cached=True)
+        tokens = _load_tokens_unlocked()
         age = time.time() - tokens["obtained_at"]
         if not force and -TOKEN_CLOCK_SKEW <= age < tokens["expires_in"] - EXPIRY_MARGIN:
             return tokens["access_token"]

@@ -355,7 +355,7 @@ def output_path(value: str | None, default_filename: str, *, root: str | None = 
     """Resolve a CSV output path beneath a controlled output root.
 
     ``--out`` is intentionally useful for scheduled jobs, but it must not let
-    command-line input redirect a run to an arbitrary file. Normalize with
+    command-line input redirect a run to an arbitrary file. Normalise with
     ``realpath`` before checking containment so both ``..`` components and
     existing symlinked directories are unable to escape the working directory.
     A caller that needs a different destination should set its process working
@@ -369,7 +369,7 @@ def output_path(value: str | None, default_filename: str, *, root: str | None = 
         raise ValueError("--out must name a .csv file")
 
     # Keep the trailing separator: /exports-old must not be treated as a child
-    # of /exports. This is a prefix check only after realpath has normalized
+    # of /exports. This is a prefix check only after realpath has normalised
     # traversal and resolved existing links.
     output_root_prefix = os.path.join(output_root, "")
     if candidate.startswith(output_root_prefix):

@@ -4,14 +4,14 @@ Usage:
     python export_tb.py --date 2026-06-30
     python export_tb.py --date 2026-06-30 --tenant "Demo Company" --out tb.csv
 
-Output: one row per account —
+Output: one row per account. Columns:
     ReportDate, Tenant, Section, AccountID, AccountName, AccountCode,
     Debit, Credit, YTDDebit, YTDCredit
 
 Column semantics per Xero's report: Debit/Credit are the CURRENT MONTH's
 movement up to the report date; YTDDebit/YTDCredit are the cumulative as-at
 balances (the pair an accountant means by "trial balance"). AccountID is the
-account GUID — the stable join key.
+account GUID, the stable join key.
 
 The balance check covers both pairs (movement and YTD) and runs before
 anything is written; an unbalanced report (truncated or misparsed) writes
@@ -42,7 +42,7 @@ ACCOUNT_PATTERN = re.compile(r"^(?P<name>.*?)\s*\((?P<code>[^()]+)\)\s*$")
 
 def is_account_code(value: str) -> bool:
     """A code is alphanumeric, at most 10 characters, with at least one digit
-    ("090", "GST1") — the same test the sibling repo's Power Query parser
+    ("090", "GST1"). This is the same test the sibling repo's Power Query parser
     applies. Anything else belongs to the name: "Term Deposit (NAB)" and
     "Rent (Sydney)" keep their parenthetical and export an empty code, which
     is what Xero's code-less bank and credit-card accounts carry anyway.
@@ -60,7 +60,7 @@ def flatten_report(report: dict) -> tuple[list[str], list[dict]]:
 
     Xero reports arrive as: Rows[] where RowType is Header (column titles),
     Section (Title + nested Rows), or Row/SummaryRow. Cell order follows the
-    Header titles. SummaryRow (section totals) is skipped — totals are
+    Header titles. SummaryRow (section totals) is skipped. Totals are
     recomputed, not trusted.
 
     Every nested list is checked before it is walked, and so is every scalar
@@ -68,7 +68,7 @@ def flatten_report(report: dict) -> tuple[list[str], list[dict]]:
     objects, and the strict zip below proves a row's cell count; without
     these checks everything between those two was unguarded, so a Rows, Cells
     or Attributes value that was a string, a mapping or a list of strings
-    called .get() on a str and printed a raw AttributeError traceback — after
+    called .get() on a str and printed a raw AttributeError traceback, after
     the tenant name had gone to stdout and the single-use refresh token
     behind the report call had been spent. cell_text() below draws the same
     line around a cell's Value.
@@ -93,7 +93,7 @@ def flatten_report(report: dict) -> tuple[list[str], list[dict]]:
         object_list proves the containers; this proves the scalar inside
         one. A missing Value and a JSON null are the blank cell the report
         format uses for a nil balance, and a JSON number is an amount
-        written another way — to_number has always coerced one with str().
+        written another way. to_number has always coerced one with str().
         Anything else is a shape change, and it used to arrive as a raw
         traceback rather than as an instruction: ACCOUNT_PATTERN.match on a
         mapping raised TypeError, and a Header cell holding a list raised
@@ -122,7 +122,7 @@ def flatten_report(report: dict) -> tuple[list[str], list[dict]]:
 
     def account_id(row: dict, where: str) -> str:
         # Every data cell carries Attributes: [{"Value": "<account guid>",
-        # "Id": "account"}] — the stable join key; codes and names change.
+        # "Id": "account"}], the stable join key; codes and names change.
         cells = object_list(row, "Cells", where)
         if not cells:
             return ""
@@ -147,7 +147,7 @@ def flatten_report(report: dict) -> tuple[list[str], list[dict]]:
                 values = cell_values(row, where)
                 record = {}
                 # strict: a row/header length mismatch means the API shape
-                # changed — fail loudly instead of exporting silent zeros.
+                # changed. Fail loudly instead of exporting silent zeros.
                 # The bare ValueError read as a crash: it landed after the
                 # tenant name had gone to stdout, so it is reported here the
                 # way every other API-shape guard in this file reports.
@@ -379,7 +379,7 @@ def output_path(value: str | None, default_filename: str, *, root: str | None = 
 
 
 def main() -> None:
-    # Non-console stdout on Windows is cp1252, not UTF-8 (PEP 528) — a macron
+    # Non-console stdout on Windows is cp1252, not UTF-8 (PEP 528). A macron
     # or CJK character in an org name must not abort a redirected or piped run
     # before the report is ever fetched.
     for stream in (sys.stdout, sys.stderr):
@@ -414,7 +414,7 @@ def main() -> None:
     if not client_id or not client_secret:
         sys.exit("Set XERO_CLIENT_ID and XERO_CLIENT_SECRET in .env (see .env.example).")
 
-    # api_get looks the access token up fresh per call — no token is held
+    # api_get looks the access token up fresh per call. No token is held
     # here, so a mid-run refresh can never leave a later call using the
     # stale one; the creds also cover the surprise-401 forced refresh
     creds = (client_id, client_secret)
@@ -473,7 +473,7 @@ def main() -> None:
         "Debit", "Credit", "YTDDebit", "YTDCredit",
     ]
 
-    # Build everything in memory and balance-check BEFORE any file exists —
+    # Build everything in memory and balance-check BEFORE any file exists:
     # a scheduled Power BI refresh reads the path, not the exit code, so an
     # unbalanced export must never reach disk.
     out_rows = []
@@ -530,7 +530,7 @@ def main() -> None:
             }
         )
 
-    # Both pairs must balance — the movement columns AND the YTD as-at
+    # Both pairs must balance: the movement columns AND the YTD as-at
     # balances (the pair the README tells users to slice). Either one out
     # means the report is truncated or misparsed.
     #

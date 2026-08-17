@@ -29,14 +29,14 @@ from xero_client import save_tokens, validate_rotated_response
 
 AUTHORIZE_URL = "https://login.xero.com/identity/connect/authorize"
 TOKEN_URL = "https://identity.xero.com/connect/token"
-# Granular scope — required for apps created on or after 2 March 2026.
+# Granular scope: required for apps created on or after 2 March 2026.
 # (The old broad accounting.reports.read only works on pre-existing apps
 # and retires in September 2027.)
 SCOPES = "offline_access accounting.reports.trialbalance.read"
 
 # An RFC 6749 error code is a single ASCII word. The callback query is
-# whatever the browser was pointed at, so anything else — escape sequences,
-# newlines, a fake instruction — never reaches the terminal verbatim.
+# whatever the browser was pointed at, so anything else (escape sequences,
+# newlines, a fake instruction) never reaches the terminal verbatim.
 ERROR_CODE = re.compile(r"[A-Za-z0-9_]{1,64}")
 
 # Wall-clock budget for the browser round trip. Without it a consent the

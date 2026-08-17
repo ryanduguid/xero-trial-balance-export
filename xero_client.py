@@ -1,6 +1,6 @@
 """Xero API client: token cache, rotation-safe refresh, authed GET.
 
-Xero refresh tokens are single-use — every refresh returns a NEW refresh
+Xero refresh tokens are single-use: every refresh returns a NEW refresh
 token, and the old one survives only a 30-minute grace period. A script
 that fails to persist the new refresh token recovers if it reruns inside
 that window and is locked out after it. Three defences here:
@@ -52,7 +52,7 @@ CRYPTPROTECT_UI_FORBIDDEN = 0x1
 EXPIRY_MARGIN = 60
 
 # Xero access tokens last 30 minutes. Used only when a refresh response's own
-# expires_in is unusable — the token still works, so the lifetime is guessed
+# expires_in is unusable. The token still works, so the lifetime is guessed
 # conservatively rather than the whole rotated pair being thrown away.
 DEFAULT_EXPIRES_IN = 1800
 
@@ -387,7 +387,7 @@ def validate_rotated_response(payload: object) -> dict:
     exchange response arrives (auth.py) the single-use authorisation code is
     already spent. Either way the pair in hand is the only way forward short
     of a full browser re-authorisation. access_token and refresh_token must
-    be present — there is nothing worth persisting without them. expires_in
+    be present: there is nothing worth persisting without them. expires_in
     is a local cache hint only, so an unusable one is replaced with the
     conservative default instead of throwing a perfectly good refresh token
     away.
@@ -614,7 +614,7 @@ def load_tokens() -> dict:
 def get_access_token(client_id: str, client_secret: str, force: bool = False) -> str:
     """Return a live access token, refreshing (and re-persisting) if needed.
 
-    force=True skips the local expiry check — for when a cached token looked
+    force=True skips the local expiry check, for when a cached token looked
     fresh but Xero returned 401 anyway (skewed clock, token.json copied from
     another machine). The lock is taken before token.json is read, so a waiter
     sees a token pair another process has already rotated instead of spending
@@ -661,7 +661,7 @@ def get_access_token(client_id: str, client_secret: str, force: bool = False) ->
                 "token cache was left untouched."
             ) from None
         new_tokens = validate_rotated_response(new_tokens)
-        _save_tokens_unlocked(new_tokens)  # persist BEFORE using — rotation safety
+        _save_tokens_unlocked(new_tokens)  # persist BEFORE using (rotation safety)
         return new_tokens["access_token"]
 
 
@@ -678,10 +678,10 @@ def api_get(
     with the reset time instead of holding the process.
 
     The access token is looked up via get_access_token() per call, never
-    passed in — a token captured once by a caller goes stale the moment any
+    passed in: a token captured once by a caller goes stale the moment any
     call refreshes it, and every later call then repeats the 401 + forced
     refresh, burning a single-use refresh token each time. A surprise 401
-    still gets one forced refresh and retry — the local expiry math can lie
+    still gets one forced refresh and retry. The local expiry math can lie
     (skewed clock, stale cache). A second 401 exits with the same
     re-authorise guidance the invalid_grant path gives, instead of a raw
     traceback.

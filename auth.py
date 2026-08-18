@@ -270,6 +270,24 @@ def main() -> None:
         auth=(client_id, client_secret),
         timeout=30,
     )
+    # The two everyday identity answers here must read as instructions, not
+    # as an HTTPError traceback - the same rule the refresh path in
+    # xero_client.py applies. invalid_grant is an authorisation code already
+    # spent or expired; 401 is a mistyped XERO_CLIENT_SECRET (OAuth2
+    # invalid_client). Nothing has been saved yet either way, so both exits
+    # simply say what to fix and neither prints the response body.
+    if resp.status_code == 400 and "invalid_grant" in resp.text:
+        sys.exit(
+            "Xero rejected the authorisation code (already used or expired). "
+            "Nothing was saved. Run again and complete the consent promptly."
+        )
+    if resp.status_code == 401:
+        sys.exit(
+            "Xero rejected this app's credentials when exchanging the "
+            "authorisation code (HTTP 401). Check XERO_CLIENT_ID and "
+            "XERO_CLIENT_SECRET in .env against the app at "
+            "developer.xero.com. Nothing was saved."
+        )
     resp.raise_for_status()
     try:
         tokens = resp.json()

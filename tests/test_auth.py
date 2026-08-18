@@ -269,11 +269,14 @@ class RealCallbackTest(unittest.TestCase):
 class _StubTokenResponse:
     """Stands in for the token endpoint's answer to the code exchange."""
 
-    def __init__(self, payload):
+    def __init__(self, payload, status_code=200, text=""):
         self._payload = payload
+        self.status_code = status_code
+        self.text = text
 
     def raise_for_status(self):
-        return None
+        if self.status_code >= 400:
+            raise RuntimeError(f"unexpected HTTP {self.status_code}")
 
     def json(self):
         return self._payload
@@ -451,6 +454,73 @@ class ExchangeResponseTest(unittest.TestCase):
         self.assertIn("non-JSON token response", str(raised.code))
         self.assertIn("Nothing was saved", str(raised.code))
         save_tokens.assert_not_called()
+
+
+class ExchangeRejectionTest(unittest.TestCase):
+    """The two everyday identity answers to the code exchange must read as
+    instructions, not as HTTPError tracebacks - the same rule
+    RefreshRejectionTest pins for the refresh path in test_xero_client.py.
+    Without the branches, the most common first-run failures (a wrong
+    XERO_CLIENT_SECRET, an expired or reused code) printed a raw traceback
+    naming the identity endpoint."""
+
+    GENERATED = "state-this-run-generated"
+
+    def _run_main(self, response):
+        port = _free_port()
+        env = {
+            "XERO_CLIENT_ID": "id-not-a-secret",
+            "XERO_CLIENT_SECRET": "secret-not-used",
+            "XERO_REDIRECT_URI": f"http://localhost:{port}/callback",
+        }
+
+        def land_the_callback(server, timeout=auth.CALLBACK_TIMEOUT):
+            server.auth_code = "the-code"
+            server.auth_error = None
+            server.returned_state = self.GENERATED
+
+        raised = None
+        with mock.patch.object(auth, "load_dotenv", lambda *a, **k: None), \
+                mock.patch.dict(os.environ, env, clear=False), \
+                mock.patch.object(auth.secrets, "token_urlsafe", return_value=self.GENERATED), \
+                mock.patch.object(auth.webbrowser, "open", return_value=False), \
+                mock.patch.object(auth, "wait_for_callback", side_effect=land_the_callback), \
+                mock.patch.object(auth.requests, "post", return_value=response), \
+                mock.patch.object(auth, "save_tokens") as save_tokens:
+            with redirect_stdout(io.StringIO()):
+                try:
+                    auth.main()
+                except SystemExit as exc:
+                    raised = exc
+        return raised, save_tokens
+
+    def test_a_spent_or_expired_code_says_so_and_saves_nothing(self):
+        raised, save_tokens = self._run_main(
+            _StubTokenResponse({}, status_code=400, text='{"error":"invalid_grant"}')
+        )
+        self.assertIsInstance(raised, SystemExit)
+        message = str(raised.code)
+        self.assertIn("authorisation code", message)
+        self.assertIn("Run again", message)
+        self.assertNotIn("the-code", message)
+        save_tokens.assert_not_called()
+
+    def test_a_rejected_client_secret_points_at_the_env_file(self):
+        raised, save_tokens = self._run_main(
+            _StubTokenResponse({}, status_code=401)
+        )
+        self.assertIsInstance(raised, SystemExit)
+        message = str(raised.code)
+        self.assertIn("XERO_CLIENT_SECRET", message)
+        self.assertIn(".env", message)
+        self.assertNotIn("secret-not-used", message)
+        save_tokens.assert_not_called()
+
+    def test_any_other_http_failure_keeps_its_traceback(self):
+        """Only the two identity answers are translated; a 500 is not an
+        instruction anyone can follow, so raise_for_status still reports it."""
+        with self.assertRaises(RuntimeError):
+            self._run_main(_StubTokenResponse({}, status_code=500))
 
 
 if __name__ == "__main__":

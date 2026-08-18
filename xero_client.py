@@ -471,6 +471,71 @@ def retry_after_seconds(value: str | None, *, now: datetime | None = None) -> in
     return min(max(0, math.ceil((retry_at - current).total_seconds())), RETRY_AFTER_CLAMP)
 
 
+def durable_replace(
+    fd: int,
+    tmp_path: str,
+    destination: str,
+    open_temp,
+    write_payload,
+    *,
+    fsync_error,
+    replace_error,
+) -> None:
+    """Write a temp file whole, fsync it, then retry os.replace onto destination.
+
+    The shared half of both durable writes in this project: save_tokens onto
+    token.json, and export_tb's CSV onto the path a scheduled Power BI
+    refresh reads. ``open_temp`` turns the mkstemp fd into a writable file
+    object (binary here, text CSV in export_tb) and ``write_payload`` writes
+    the whole document to it; an exception out of either passes through
+    unchanged, and the temp file is deleted because it holds nothing worth
+    keeping yet.
+
+    Past the flush the rule inverts. The temp file is complete, and on both
+    sites it holds work that cannot be repeated for free (a freshly rotated
+    refresh token, a fetched report), so a failure after that point keeps the
+    file and raises SystemExit with the site's recovery message instead:
+    ``fsync_error`` and ``replace_error`` each build that message from the
+    failure, naming the temp path so the document can be moved into place by
+    hand.
+    """
+    written = False
+    try:
+        with open_temp(fd) as fh:
+            write_payload(fh)
+            fh.flush()
+            # The flush is what makes the file whole, which is all "written"
+            # claims. Past this line the temp file holds the complete
+            # document, so the finally clause below must never delete it.
+            written = True
+            # Flushing only reaches the OS page cache; NTFS journals the
+            # rename's metadata, not the data behind it. Force the bytes down
+            # before os.replace destroys what the destination holds now.
+            try:
+                os.fsync(fh.fileno())
+            except OSError as exc:
+                raise SystemExit(fsync_error(exc)) from None
+
+        # os.replace fails on Windows while another process holds the
+        # destination open; see REPLACE_ATTEMPTS above for why both sites
+        # ride that out rather than losing the finished document.
+        last_error: OSError | None = None
+        for attempt in range(REPLACE_ATTEMPTS):
+            try:
+                os.replace(tmp_path, destination)
+                return
+            except OSError as exc:
+                last_error = exc
+                if attempt < REPLACE_ATTEMPTS - 1:
+                    time.sleep(REPLACE_BACKOFF * (attempt + 1))
+        raise SystemExit(replace_error(last_error))
+    finally:
+        # A half-written temp file is worthless; a fully written one is the
+        # only copy of the finished document and must survive.
+        if not written and os.path.exists(tmp_path):
+            os.unlink(tmp_path)
+
+
 def save_tokens(token_response: dict) -> None:
     """Serialise and atomically persist a token endpoint response."""
     with _token_cache_lock():
@@ -512,70 +577,60 @@ def _persist_token_cache_unlocked(data: dict, *, legacy_migration: bool) -> None
             os.unlink(tmp_path)
         raise
 
-    written = False
-    try:
-        with os.fdopen(fd, "wb") as fh:
-            if fh.write(encoded) != len(encoded):
-                raise OSError("short write while saving token cache")
-            fh.flush()
-            # The flush is what makes the file whole, which is all "written"
-            # claims. Past this line the temp file holds the complete new
-            # pair and is worth more than token.json, so the finally clause
-            # below must never delete it.
-            written = True
-            # Flushing only reaches the OS page cache; NTFS journals the
-            # rename's metadata, not the data behind it. Force the bytes down
-            # before os.replace destroys the previous token pair.
-            try:
-                os.fsync(fh.fileno())
-            except OSError as exc:
-                if legacy_migration:
-                    raise SystemExit(
-                        f"error: wrote an encrypted replacement for the legacy "
-                        f"token cache to {tmp_path} but could not flush it to "
-                        f"disk ({exc}). {TOKEN_FILE} was left unchanged and no "
-                        "Xero request was made. Delete the temp file and retry."
-                    ) from None
-                raise SystemExit(
-                    f"error: wrote the new Xero token pair to {tmp_path} but "
-                    f"could not flush it to disk ({exc}). {TOKEN_FILE} still "
-                    f"holds the refresh token Xero has already consumed, so "
-                    f"leave it alone: copy {tmp_path} over {TOKEN_FILE} "
-                    "within Xero's 30-minute rotation grace window, or run: "
-                    "python auth.py"
-                ) from None
+    def write_encoded(fh) -> None:
+        if fh.write(encoded) != len(encoded):
+            raise OSError("short write while saving token cache")
 
-        last_error: OSError | None = None
-        for attempt in range(REPLACE_ATTEMPTS):
-            try:
-                os.replace(tmp_path, TOKEN_FILE)
-                return
-            except OSError as exc:
-                last_error = exc
-                if attempt < REPLACE_ATTEMPTS - 1:
-                    time.sleep(REPLACE_BACKOFF * (attempt + 1))
+    if legacy_migration:
 
-        if legacy_migration:
-            raise SystemExit(
+        def fsync_error(exc: OSError) -> str:
+            return (
+                f"error: wrote an encrypted replacement for the legacy "
+                f"token cache to {tmp_path} but could not flush it to "
+                f"disk ({exc}). {TOKEN_FILE} was left unchanged and no "
+                "Xero request was made. Delete the temp file and retry."
+            )
+
+        def replace_error(last_error: OSError | None) -> str:
+            return (
                 f"error: wrote an encrypted replacement for the legacy token "
                 f"cache to {tmp_path} but could not move it onto {TOKEN_FILE} "
                 f"after {REPLACE_ATTEMPTS} attempts ({last_error}). The legacy "
                 "cache was left unchanged and no Xero request was made. Delete "
                 "the temp file and retry."
             )
-        raise SystemExit(
-            f"error: wrote the new Xero token pair to {tmp_path} but could not "
-            f"move it onto {TOKEN_FILE} after {REPLACE_ATTEMPTS} attempts "
-            f"({last_error}). {TOKEN_FILE} still holds the refresh token Xero "
-            f"has already consumed, so leave it alone: copy {tmp_path} over "
-            f"{TOKEN_FILE} within Xero's 30-minute rotation grace window, or "
-            "run: python auth.py"
-        )
-    finally:
-        # A half-written temp file is worthless; a fully written one is the
-        # only copy of the new refresh token and must survive.
-        if not written and os.path.exists(tmp_path):
-            os.unlink(tmp_path)
+
+    else:
+
+        def fsync_error(exc: OSError) -> str:
+            return (
+                f"error: wrote the new Xero token pair to {tmp_path} but "
+                f"could not flush it to disk ({exc}). {TOKEN_FILE} still "
+                f"holds the refresh token Xero has already consumed, so "
+                f"leave it alone: copy {tmp_path} over {TOKEN_FILE} "
+                "within Xero's 30-minute rotation grace window, or run: "
+                "python auth.py"
+            )
+
+        def replace_error(last_error: OSError | None) -> str:
+            return (
+                f"error: wrote the new Xero token pair to {tmp_path} but could not "
+                f"move it onto {TOKEN_FILE} after {REPLACE_ATTEMPTS} attempts "
+                f"({last_error}). {TOKEN_FILE} still holds the refresh token Xero "
+                f"has already consumed, so leave it alone: copy {tmp_path} over "
+                f"{TOKEN_FILE} within Xero's 30-minute rotation grace window, or "
+                "run: python auth.py"
+            )
+
+    durable_replace(
+        fd,
+        tmp_path,
+        TOKEN_FILE,
+        lambda f: os.fdopen(f, "wb"),
+        write_encoded,
+        fsync_error=fsync_error,
+        replace_error=replace_error,
+    )
 
 
 def _load_tokens_unlocked() -> dict:

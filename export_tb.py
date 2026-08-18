@@ -32,7 +32,10 @@ from decimal import Decimal, Inexact, InvalidOperation, localcontext
 import requests
 from dotenv import load_dotenv
 
-from xero_client import REPLACE_ATTEMPTS, REPLACE_BACKOFF, api_get, get_connections
+# REPLACE_BACKOFF and the time import above have no callers left in this
+# module, but the durable-write tests reach both through export_tb (reading
+# the backoff, patching time.sleep), so they stay.
+from xero_client import REPLACE_ATTEMPTS, REPLACE_BACKOFF, api_get, durable_replace, get_connections
 
 REPORT_URL = "https://api.xero.com/api.xro/2.0/Reports/TrialBalance"
 
@@ -385,6 +388,200 @@ def output_path(value: str | None, default_filename: str, *, root: str | None = 
     raise ValueError("--out must be a relative path beneath the current working directory")
 
 
+def select_tenant(connections: list[dict], tenant_arg: str | None) -> dict:
+    """Resolve exactly one organisation to export, or exit naming the choices.
+
+    A bare multi-organisation run is refused on purpose: silently picking
+    the first connection can export the wrong entity.
+    """
+    if tenant_arg:
+        matches = [c for c in connections if tenant_arg.lower() in c["tenantName"].lower()]
+        if not matches:
+            names = ", ".join(c["tenantName"] for c in connections)
+            sys.exit(f'No tenant matching "{tenant_arg}". Connected: {names}')
+        if len(matches) > 1:
+            names = ", ".join(c["tenantName"] for c in matches)
+            sys.exit(f'"{tenant_arg}" matches more than one organisation ({names}) - narrow it.')
+        return matches[0]
+    if len(connections) > 1:
+        names = ", ".join(c["tenantName"] for c in connections)
+        sys.exit(f"More than one organisation connected ({names}) - pick one with --tenant.")
+    return connections[0]
+
+
+def build_rows(
+    rows: list[dict], tenant: dict, report_date: str
+) -> tuple[list[dict], tuple[Decimal, Decimal, Decimal, Decimal]]:
+    """Build the CSV rows and the four exact totals, entirely in memory.
+
+    Totals are (movement debit, movement credit, YTD debit, YTD credit),
+    the shape check_balanced reads.
+    """
+    out_rows = []
+    total_debit = total_credit = Decimal("0")
+    total_ytd_debit = total_ytd_credit = Decimal("0")
+    for record in rows:
+        account_raw = record.get("Account", "")
+        match = ACCOUNT_PATTERN.match(account_raw)
+        if match and is_account_code(match.group("code")):
+            name, code = match.group("name"), match.group("code")
+        else:
+            name, code = account_raw, ""
+
+        debit = to_number(record.get("Debit"))
+        credit = to_number(record.get("Credit"))
+        ytd_debit = to_number(record.get("YTD Debit"))
+        ytd_credit = to_number(record.get("YTD Credit"))
+        # Decimal construction is exact but arithmetic rounds at the context
+        # precision (28 by default), so a default-context total could silently
+        # drop a final cent and pass a report that does not balance.
+        #
+        # A digit count cannot close that on its own: to_number bounds the
+        # exponent, not the significant digits, so no fixed precision is
+        # provably enough. Trapping Inexact makes silent rounding impossible
+        # instead of merely unlikely, and a report that would need more
+        # precision is refused rather than printing "Balance check OK".
+        with localcontext() as exact:
+            exact.prec = 60
+            exact.traps[Inexact] = True
+            try:
+                total_debit += debit
+                total_credit += credit
+                total_ytd_debit += ytd_debit
+                total_ytd_credit += ytd_credit
+            except Inexact:
+                sys.exit(
+                    "Nothing written - a reported amount needs more precision "
+                    "than the balance check can carry exactly, so the totals "
+                    "cannot be trusted. Check the report for a malformed cell."
+                )
+
+        out_rows.append(
+            {
+                "ReportDate": report_date,
+                "Tenant": excel_safe(tenant["tenantName"]),
+                "Section": excel_safe(record.get("Section", "")),
+                "AccountID": excel_safe(record.get("AccountID", "")),
+                "AccountName": excel_safe(name),
+                "AccountCode": excel_safe(code),
+                "Debit": format_amount(debit),
+                "Credit": format_amount(credit),
+                "YTDDebit": format_amount(ytd_debit),
+                "YTDCredit": format_amount(ytd_credit),
+            }
+        )
+
+    return out_rows, (total_debit, total_credit, total_ytd_debit, total_ytd_credit)
+
+
+def check_balanced(totals: tuple[Decimal, Decimal, Decimal, Decimal]) -> None:
+    """Exit without writing unless both column pairs balance exactly.
+
+    Both pairs must balance: the movement columns AND the YTD as-at
+    balances (the pair the README tells users to slice). Either one out
+    means the report is truncated or misparsed.
+
+    The comparison is exact. The old round(diff, 2) existed to absorb float
+    noise, and it also swallowed real differences under half a cent; with
+    Decimal totals there is no noise to absorb, so any difference at all is
+    a difference Xero did not send.
+    """
+    total_debit, total_credit, total_ytd_debit, total_ytd_credit = totals
+    unbalanced = False
+    for label, debits, credits in (
+        ("movement", total_debit, total_credit),
+        ("YTD", total_ytd_debit, total_ytd_credit),
+    ):
+        with localcontext() as exact:
+            exact.prec = 60
+            exact.traps[Inexact] = True
+            try:
+                diff = debits - credits
+            except Inexact:
+                sys.exit(
+                    "Nothing written - the {0} difference cannot be computed "
+                    "exactly, so the balance check cannot be trusted.".format(label)
+                )
+        if diff != 0:
+            print(
+                f"WARNING: {label} debits {debits:,.2f} != credits "
+                f"{credits:,.2f} (diff {format_amount(diff)})"
+            )
+            unbalanced = True
+    if unbalanced:
+        print("Nothing written - report likely truncated or misparsed.")
+        sys.exit(1)
+
+
+def write_csv(out_rows: list[dict], out_path: str) -> None:
+    """Write the finished export atomically, through durable_replace.
+
+    Atomic write (temp file + replace), mirroring save_tokens(): a crash
+    or disk-full mid-write must never leave a truncated CSV at the path a
+    scheduled Power BI refresh reads. Past the flush the temp file holds
+    the complete, balance-checked export and the API call that produced it
+    cannot be replayed for free, so on an fsync or replace failure
+    durable_replace keeps the temp file and names it in the error instead
+    of deleting it.
+    """
+    fieldnames = [
+        "ReportDate", "Tenant", "Section", "AccountID", "AccountName", "AccountCode",
+        "Debit", "Credit", "YTDDebit", "YTDCredit",
+    ]
+
+    out_dir = os.path.dirname(os.path.abspath(out_path)) or "."
+    # output_path accepts a nested relative --out ("exports/tb.csv") whose
+    # parent need not exist yet, and mkstemp below raised FileNotFoundError
+    # for it - after the report had been fetched and this run's single-use
+    # refresh token spent.
+    try:
+        os.makedirs(out_dir, exist_ok=True)
+    except OSError as exc:
+        sys.exit(f"error: cannot create the output directory {out_dir} ({exc}).")
+    fd, tmp_path = tempfile.mkstemp(dir=out_dir, suffix=".csv.tmp")
+
+    def write_rows(fh) -> None:
+        writer = csv.DictWriter(fh, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(out_rows)
+
+    def fsync_error(exc: OSError) -> str:
+        return (
+            f"error: wrote the balanced export to {tmp_path} but could "
+            f"not flush it to disk ({exc}). The file is complete and "
+            f"balance-checked: rename {tmp_path} over {out_path} once "
+            "the disk is writable - the report has been fetched "
+            "already and re-running spends another refresh token."
+        )
+
+    def replace_error(last_error: OSError | None) -> str:
+        return (
+            f"error: wrote the balanced export to {tmp_path} but could not move "
+            f"it onto {out_path} after {REPLACE_ATTEMPTS} attempts "
+            f"({last_error}). Close whatever holds {out_path} open (Excel or "
+            f"Power BI Desktop keep a lock on it), then rename {tmp_path} over "
+            "it - the report has been fetched already and re-running spends "
+            "another refresh token."
+        )
+
+    # os.replace onto the destination fails on Windows while Excel or Power BI
+    # Desktop holds it open, which is exactly the README's scheduled-refresh
+    # recipe; durable_replace rides out the same lock it rides for
+    # save_tokens. On a permanent failure the temp file survives and is
+    # named, so the export can be moved into place by hand.
+    durable_replace(
+        fd,
+        tmp_path,
+        out_path,
+        # utf-8-sig: the BOM is what makes Excel's double-click open decode
+        # non-ASCII names correctly; Power BI and pandas strip it anyway.
+        lambda f: os.fdopen(f, "w", newline="", encoding="utf-8-sig"),
+        write_rows,
+        fsync_error=fsync_error,
+        replace_error=replace_error,
+    )
+
+
 def main() -> None:
     # Non-console stdout on Windows is cp1252, not UTF-8 (PEP 528). A macron
     # or CJK character in an org name must not abort a redirected or piped run
@@ -429,20 +626,7 @@ def main() -> None:
     connections = validated_connections(get_connections(creds))
     if not connections:
         sys.exit("No Xero organisations authorised for this app - run auth.py again.")
-    if args.tenant:
-        matches = [c for c in connections if args.tenant.lower() in c["tenantName"].lower()]
-        if not matches:
-            names = ", ".join(c["tenantName"] for c in connections)
-            sys.exit(f'No tenant matching "{args.tenant}". Connected: {names}')
-        if len(matches) > 1:
-            names = ", ".join(c["tenantName"] for c in matches)
-            sys.exit(f'"{args.tenant}" matches more than one organisation ({names}) - narrow it.')
-        tenant = matches[0]
-    else:
-        if len(connections) > 1:
-            names = ", ".join(c["tenantName"] for c in connections)
-            sys.exit(f"More than one organisation connected ({names}) - pick one with --tenant.")
-        tenant = connections[0]
+    tenant = select_tenant(connections, args.tenant)
     print(f"Tenant: {tenant['tenantName']}")
 
     params = {"date": args.date}
@@ -475,176 +659,14 @@ def main() -> None:
     except ValueError as exc:
         parser.error(str(exc))
 
-    fieldnames = [
-        "ReportDate", "Tenant", "Section", "AccountID", "AccountName", "AccountCode",
-        "Debit", "Credit", "YTDDebit", "YTDCredit",
-    ]
-
     # Build everything in memory and balance-check BEFORE any file exists:
     # a scheduled Power BI refresh reads the path, not the exit code, so an
     # unbalanced export must never reach disk.
-    out_rows = []
-    total_debit = total_credit = Decimal("0")
-    total_ytd_debit = total_ytd_credit = Decimal("0")
-    for record in rows:
-        account_raw = record.get("Account", "")
-        match = ACCOUNT_PATTERN.match(account_raw)
-        if match and is_account_code(match.group("code")):
-            name, code = match.group("name"), match.group("code")
-        else:
-            name, code = account_raw, ""
+    out_rows, totals = build_rows(rows, tenant, args.date)
+    check_balanced(totals)
+    write_csv(out_rows, out_path)
 
-        debit = to_number(record.get("Debit"))
-        credit = to_number(record.get("Credit"))
-        ytd_debit = to_number(record.get("YTD Debit"))
-        ytd_credit = to_number(record.get("YTD Credit"))
-        # Decimal construction is exact but arithmetic rounds at the context
-        # precision (28 by default), so a default-context total could silently
-        # drop a final cent and pass a report that does not balance.
-        #
-        # A digit count cannot close that on its own: to_number bounds the
-        # exponent, not the significant digits, so no fixed precision is
-        # provably enough. Trapping Inexact makes silent rounding impossible
-        # instead of merely unlikely, and a report that would need more
-        # precision is refused rather than printing "Balance check OK".
-        with localcontext() as exact:
-            exact.prec = 60
-            exact.traps[Inexact] = True
-            try:
-                total_debit += debit
-                total_credit += credit
-                total_ytd_debit += ytd_debit
-                total_ytd_credit += ytd_credit
-            except Inexact:
-                sys.exit(
-                    "Nothing written - a reported amount needs more precision "
-                    "than the balance check can carry exactly, so the totals "
-                    "cannot be trusted. Check the report for a malformed cell."
-                )
-
-        out_rows.append(
-            {
-                "ReportDate": args.date,
-                "Tenant": excel_safe(tenant["tenantName"]),
-                "Section": excel_safe(record.get("Section", "")),
-                "AccountID": excel_safe(record.get("AccountID", "")),
-                "AccountName": excel_safe(name),
-                "AccountCode": excel_safe(code),
-                "Debit": format_amount(debit),
-                "Credit": format_amount(credit),
-                "YTDDebit": format_amount(ytd_debit),
-                "YTDCredit": format_amount(ytd_credit),
-            }
-        )
-
-    # Both pairs must balance: the movement columns AND the YTD as-at
-    # balances (the pair the README tells users to slice). Either one out
-    # means the report is truncated or misparsed.
-    #
-    # The comparison is exact. The old round(diff, 2) existed to absorb float
-    # noise, and it also swallowed real differences under half a cent; with
-    # Decimal totals there is no noise to absorb, so any difference at all is
-    # a difference Xero did not send.
-    unbalanced = False
-    for label, debits, credits in (
-        ("movement", total_debit, total_credit),
-        ("YTD", total_ytd_debit, total_ytd_credit),
-    ):
-        with localcontext() as exact:
-            exact.prec = 60
-            exact.traps[Inexact] = True
-            try:
-                diff = debits - credits
-            except Inexact:
-                sys.exit(
-                    "Nothing written - the {0} difference cannot be computed "
-                    "exactly, so the balance check cannot be trusted.".format(label)
-                )
-        if diff != 0:
-            print(
-                f"WARNING: {label} debits {debits:,.2f} != credits "
-                f"{credits:,.2f} (diff {format_amount(diff)})"
-            )
-            unbalanced = True
-    if unbalanced:
-        print("Nothing written - report likely truncated or misparsed.")
-        sys.exit(1)
-
-    # Atomic write (temp file + replace), mirroring save_tokens(): a crash
-    # or disk-full mid-write must never leave a truncated CSV at the path a
-    # scheduled Power BI refresh reads.
-    out_dir = os.path.dirname(os.path.abspath(out_path)) or "."
-    # output_path accepts a nested relative --out ("exports/tb.csv") whose
-    # parent need not exist yet, and mkstemp below raised FileNotFoundError
-    # for it - after the report had been fetched and this run's single-use
-    # refresh token spent.
-    try:
-        os.makedirs(out_dir, exist_ok=True)
-    except OSError as exc:
-        sys.exit(f"error: cannot create the output directory {out_dir} ({exc}).")
-    fd, tmp_path = tempfile.mkstemp(dir=out_dir, suffix=".csv.tmp")
-    written = False
-    try:
-        # utf-8-sig: the BOM is what makes Excel's double-click open decode
-        # non-ASCII names correctly; Power BI and pandas strip it anyway.
-        with os.fdopen(fd, "w", newline="", encoding="utf-8-sig") as fh:
-            writer = csv.DictWriter(fh, fieldnames=fieldnames)
-            writer.writeheader()
-            writer.writerows(out_rows)
-            fh.flush()
-            # The flush is what makes the file whole, which is all "written"
-            # claims - the same line save_tokens draws. Past it the temp file
-            # holds the complete, balance-checked export and the API call that
-            # produced it cannot be replayed for free. It is worth more than
-            # the stale CSV at out_path, so the finally clause below must
-            # never delete it.
-            written = True
-            # Flushing only reaches the OS page cache; NTFS journals the
-            # rename's metadata, not the data behind it. Force the bytes down
-            # before os.replace destroys the previous export. A failure here
-            # is a disk that would not take the write, not a half-built file:
-            # setting written above and exiting with the temp path named keeps
-            # the export recoverable instead of unlinking it and printing a
-            # bare OSError traceback, which run() does not catch.
-            try:
-                os.fsync(fh.fileno())
-            except OSError as exc:
-                raise SystemExit(
-                    f"error: wrote the balanced export to {tmp_path} but could "
-                    f"not flush it to disk ({exc}). The file is complete and "
-                    f"balance-checked: rename {tmp_path} over {out_path} once "
-                    "the disk is writable - the report has been fetched "
-                    "already and re-running spends another refresh token."
-                ) from None
-    finally:
-        if not written and os.path.exists(tmp_path):
-            os.unlink(tmp_path)
-
-    # os.replace onto the destination fails on Windows while Excel or Power BI
-    # Desktop holds it open, which is exactly the README's scheduled-refresh
-    # recipe. save_tokens rides out the same lock; without the retry here the
-    # finally clause above deleted a good export and left the stale file in
-    # place. On a permanent failure the temp file survives and is named, so
-    # the export can be moved into place by hand.
-    last_error: OSError | None = None
-    for attempt in range(REPLACE_ATTEMPTS):
-        try:
-            os.replace(tmp_path, out_path)
-            break
-        except OSError as exc:
-            last_error = exc
-            if attempt < REPLACE_ATTEMPTS - 1:
-                time.sleep(REPLACE_BACKOFF * (attempt + 1))
-    else:
-        raise SystemExit(
-            f"error: wrote the balanced export to {tmp_path} but could not move "
-            f"it onto {out_path} after {REPLACE_ATTEMPTS} attempts "
-            f"({last_error}). Close whatever holds {out_path} open (Excel or "
-            f"Power BI Desktop keep a lock on it), then rename {tmp_path} over "
-            "it - the report has been fetched already and re-running spends "
-            "another refresh token."
-        )
-
+    total_debit, _, total_ytd_debit, _ = totals
     print(f"Wrote {len(out_rows)} accounts to {out_path}")
     print(f"Balance check OK: movement debits = credits = {total_debit:,.2f}; YTD = {total_ytd_debit:,.2f}")
 

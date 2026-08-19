@@ -44,19 +44,19 @@ DEFAULT_TOKEN_FILE = os.path.join(
 def resolve_token_file(cli_value: str | None = None) -> str:
     """Resolve the token cache path.
 
-    Order: the XERO_TOKEN_FILE environment variable, then an explicit
-    command-line value (export_tb.py's --token-file), then the
-    module-relative default. The environment variable wins over the flag so
-    a scheduled job's environment can pin the cache for every invocation,
-    however the command line is written. The result is absolute, so the
-    sibling lock path (``<cache>.lock``) stays beside the cache whatever the
-    process working directory is.
+    Order: an explicit command-line value (export_tb.py's --token-file),
+    then the XERO_TOKEN_FILE environment variable, then the module-relative
+    default. An operator who passes the flag gets exactly the cache they
+    asked for; a scheduled job that sets only the environment variable is
+    unaffected. The result is absolute, so the sibling lock path
+    (``<cache>.lock``) stays beside the cache whatever the process working
+    directory is.
     """
+    if cli_value is not None and cli_value.strip():
+        return os.path.abspath(cli_value)
     env_value = os.environ.get("XERO_TOKEN_FILE")
     if env_value is not None and env_value.strip():
         return os.path.abspath(env_value)
-    if cli_value is not None and cli_value.strip():
-        return os.path.abspath(cli_value)
     return DEFAULT_TOKEN_FILE
 
 

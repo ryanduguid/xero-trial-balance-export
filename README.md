@@ -2,7 +2,7 @@
 
 [![Verify](https://github.com/ryanduguid/xero-trial-balance-export/actions/workflows/verify.yml/badge.svg)](https://github.com/ryanduguid/xero-trial-balance-export/actions/workflows/verify.yml) [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE) [![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/downloads/)
 
-Pull a trial balance straight from the Xero API into a tidy CSV that Power BI (or pandas, or Excel) loads without cleanup. No SDK, no framework, just three short, readable Python files showing exactly how Xero OAuth2 works, including the part that breaks most scheduled scripts.
+Pull a trial balance straight from the Xero API into a tidy CSV that Power BI (or pandas, or Excel) loads without cleanup. No SDK, no framework, just three readable Python files showing exactly how Xero OAuth2 works, including the part that breaks most scheduled scripts.
 
 ## Why
 
@@ -37,7 +37,12 @@ The CSV is written as UTF-8 with a BOM (`utf-8-sig`): Excel's double-click open 
 
 ## Power BI
 
-Get Data → Text/CSV → point at the export. Columns arrive typed and tidy; `Section` and `AccountCode` are ready for slicers and drill-downs. For a zero-click refresh, set the scheduled task's working directory (Windows **Start in**, or cron's `cd`) to the fixed Power BI data directory, then schedule `export_tb.py` with an explicit `--tenant` and relative `--out`, e.g. from `C:\data`: `python C:\path\to\export_tb.py --tenant "Org Name" --out tb-latest.csv`. Run the Windows task in the same Windows user profile that ran `auth.py`: current-user DPAPI is deliberately not a portable cache format, and a non-Windows process cannot decrypt it. The default filename embeds the report date, so a bare scheduled run writes a new file every day while Power BI keeps refreshing the stale one from setup day. Concurrent exports using the same checkout serialise their token-cache read, migration, refresh and write through `token.json.lock`; a waiter re-reads the rotated cache instead of spending the same refresh token. The lock coordinates processes using that local cache, not copies of `token.json` on other machines. If the destination CSV is locked when the export finishes (Excel or Power BI Desktop holding it open), the run retries briefly, then exits non-zero and leaves the finished export beside it as a `*.csv.tmp`, naming that file in the error. Rename it into place rather than re-running, because the report has already been fetched and a re-run spends another refresh token. A disk that refuses the final flush is handled the same way: once the rows are written the `*.csv.tmp` is complete and balance-checked, so it is kept and named in the error instead of being deleted. Nothing deletes those files, so a scheduled job against a destination that stays locked leaves one per run.
+1. Get Data → Text/CSV → point at the export. Columns arrive typed and tidy; `Section` and `AccountCode` are ready for slicers and drill-downs.
+2. For a zero-click refresh, set the scheduled task's working directory (Windows **Start in**, or cron's `cd`) to the fixed Power BI data directory, then schedule `export_tb.py` with an explicit `--tenant` and relative `--out`, e.g. from `C:\data`: `python C:\path\to\export_tb.py --tenant "Org Name" --out tb-latest.csv`.
+3. Run the Windows task in the same Windows user profile that ran `auth.py`: current-user DPAPI is deliberately not a portable cache format, and a non-Windows process cannot decrypt it.
+4. Pin the output name with `--out`, as above. The default filename embeds the report date, so a bare scheduled run writes a new file every day while Power BI keeps refreshing the stale one from setup day.
+
+When a run hits a locked destination, a concurrent export, or a disk that refuses the final flush, see the "Power BI failure modes" appendix below.
 
 Two Xero platform limits worth knowing: uncertified apps connect to at most 25 organisations (the Demo Company doesn't count), and going past that requires App Partner certification.
 
@@ -91,6 +96,14 @@ repository root:
 ```bash
 python -B -m unittest discover -s tests -v
 ```
+
+## Power BI failure modes
+
+Concurrent exports using the same checkout serialise their token-cache read, migration, refresh and write through `token.json.lock`; a waiter re-reads the rotated cache instead of spending the same refresh token. The lock coordinates processes using that local cache, not copies of `token.json` on other machines.
+
+If the destination CSV is locked when the export finishes (Excel or Power BI Desktop holding it open), the run retries briefly, then exits non-zero and leaves the finished export beside it as a `*.csv.tmp`, naming that file in the error. Rename it into place rather than re-running, because the report has already been fetched and a re-run spends another refresh token.
+
+A disk that refuses the final flush is handled the same way: once the rows are written the `*.csv.tmp` is complete and balance-checked, so it is kept and named in the error instead of being deleted. Nothing deletes those files, so a scheduled job against a destination that stays locked leaves one per run.
 
 ## Filename reference
 

@@ -11,6 +11,7 @@ from unittest import mock
 from unittest.mock import patch
 
 import export_tb
+import xero_client
 from export_tb import main, output_path
 
 
@@ -728,7 +729,7 @@ class OutputReplaceLockTest(_ExportCase):
             return real_replace(src, dst)
 
         with mock.patch.object(export_tb.os, "replace", side_effect=flaky), \
-                mock.patch.object(export_tb.time, "sleep") as sleep:
+                mock.patch.object(xero_client.time, "sleep") as sleep:
             raised, _, data = self.run_export(self.BALANCED)
 
         self.assertIsNone(raised)
@@ -736,7 +737,7 @@ class OutputReplaceLockTest(_ExportCase):
         self.assertIsNotNone(data)
         self.assertEqual(
             [c.args[0] for c in sleep.call_args_list],
-            [export_tb.REPLACE_BACKOFF * 1, export_tb.REPLACE_BACKOFF * 2],
+            [xero_client.REPLACE_BACKOFF * 1, xero_client.REPLACE_BACKOFF * 2],
         )
         self.assertEqual(
             [f for f in os.listdir(self.work_dir) if f.endswith(".tmp")], []
@@ -745,14 +746,14 @@ class OutputReplaceLockTest(_ExportCase):
     def test_a_held_destination_keeps_the_finished_export_and_names_it(self):
         err = PermissionError(13, "Access is denied")
         with mock.patch.object(export_tb.os, "replace", side_effect=err), \
-                mock.patch.object(export_tb.time, "sleep") as sleep:
+                mock.patch.object(xero_client.time, "sleep") as sleep:
             raised, _, data = self.run_export(self.BALANCED)
 
         self.assertIsInstance(raised, SystemExit)
         message = str(raised.code)
         self.assertTrue(message.startswith("error: "), message)
         self.assertIn("tb.csv", message)
-        self.assertEqual(sleep.call_count, export_tb.REPLACE_ATTEMPTS - 1)
+        self.assertEqual(sleep.call_count, xero_client.REPLACE_ATTEMPTS - 1)
         self.assertIsNone(data, "os.replace never ran, so nothing is at --out")
 
         leftovers = [f for f in os.listdir(self.work_dir) if f.endswith(".tmp")]

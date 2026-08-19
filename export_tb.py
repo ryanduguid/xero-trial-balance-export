@@ -24,7 +24,6 @@ import os
 import re
 import sys
 import tempfile
-import time
 import unicodedata
 from datetime import date
 from decimal import Decimal, Inexact, InvalidOperation, localcontext
@@ -32,11 +31,8 @@ from decimal import Decimal, Inexact, InvalidOperation, localcontext
 import requests
 from dotenv import load_dotenv
 
-# REPLACE_BACKOFF and the time import above have no callers left in this
-# module, but the durable-write tests reach both through export_tb (reading
-# the backoff, patching time.sleep), so they stay.
 import xero_client
-from xero_client import REPLACE_ATTEMPTS, REPLACE_BACKOFF, api_get, durable_replace, get_connections
+from xero_client import REPLACE_ATTEMPTS, api_get, durable_replace, get_connections
 
 REPORT_URL = "https://api.xero.com/api.xro/2.0/Reports/TrialBalance"
 

@@ -64,3 +64,19 @@ gh release verify "$tag" -R "$repo"
 ```
 
 If any gate fails, inspect it before touching the draft. Never move, delete or reuse a protected release tag, whether or not publication completed.
+
+## PyPI trusted publishing
+
+The `pypi` job in `release.yml` uploads the sdist and wheel to PyPI after the GitHub release job succeeds. It authenticates with OIDC trusted publishing, so the repository stores no PyPI API token. Until an owner registers the trusted publisher on PyPI, the job fails at the upload step without affecting the GitHub release.
+
+Register the publisher once at PyPI under the project's Publishing settings (or as a pending publisher before the first upload) with exactly these values:
+
+| Field | Value |
+|---|---|
+| PyPI project name | `xero-trial-balance-export` |
+| Owner | `ryanduguid` |
+| Repository name | `xero-trial-balance-export` |
+| Workflow name | `release.yml` |
+| Environment name | `pypi` |
+
+Also create the `pypi` environment in the repository settings and restrict it to protected tags, so a publish requires the same rulesets that guard `v*` tags.

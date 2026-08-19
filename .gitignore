@@ -41,3 +41,6 @@ venv/
 .DS_Store
 Thumbs.db
 desktop.ini
+dist/
+build/
+*.egg-info/

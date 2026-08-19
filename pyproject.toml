@@ -1,0 +1,39 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "xero-trial-balance-export"
+description = "Export a Xero trial balance to a tidy CSV for Power BI, pandas or Excel."
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+requires-python = ">=3.10"
+dependencies = [
+    "requests>=2.34.2",
+    "python-dotenv>=1.2.2",
+]
+dynamic = ["version"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Operating System :: OS Independent",
+    "Topic :: Office/Business :: Financial :: Accounting",
+]
+
+[project.urls]
+Homepage = "https://github.com/ryanduguid/xero-trial-balance-export"
+Issues = "https://github.com/ryanduguid/xero-trial-balance-export/issues"
+
+[project.scripts]
+export-tb = "export_tb:main"
+xero-tb-auth = "auth:main"
+
+[tool.setuptools]
+py-modules = ["auth", "xero_client", "export_tb"]
+
+[tool.setuptools.dynamic]
+version = { file = "VERSION" }

@@ -25,6 +25,7 @@ from urllib.parse import urlencode, urlparse, parse_qs
 import requests
 from dotenv import load_dotenv
 
+import xero_client
 from xero_client import save_tokens, validate_rotated_response
 
 AUTHORIZE_URL = "https://login.xero.com/identity/connect/authorize"
@@ -200,6 +201,9 @@ class _CallbackHandler(BaseHTTPRequestHandler):
 
 def main() -> None:
     load_dotenv()
+    # Re-resolve after load_dotenv: a XERO_TOKEN_FILE set in .env is not in
+    # the environment when xero_client is imported.
+    xero_client.TOKEN_FILE = xero_client.resolve_token_file()
     client_id = os.environ.get("XERO_CLIENT_ID")
     client_secret = os.environ.get("XERO_CLIENT_SECRET")
     redirect_uri = os.environ.get("XERO_REDIRECT_URI", "http://localhost:8400/callback")

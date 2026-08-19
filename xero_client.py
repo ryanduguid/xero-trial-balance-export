@@ -34,7 +34,35 @@ import requests
 
 TOKEN_URL = "https://identity.xero.com/connect/token"
 CONNECTIONS_URL = "https://api.xero.com/connections"
-TOKEN_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "token.json")
+# The historical cache location: next to this module. Kept as the fallback so
+# existing installs keep reading the token.json they already have.
+DEFAULT_TOKEN_FILE = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "token.json"
+)
+
+
+def resolve_token_file(cli_value: str | None = None) -> str:
+    """Resolve the token cache path.
+
+    Order: the XERO_TOKEN_FILE environment variable, then an explicit
+    command-line value (export_tb.py's --token-file), then the
+    module-relative default. The environment variable wins over the flag so
+    a scheduled job's environment can pin the cache for every invocation,
+    however the command line is written. The result is absolute, so the
+    sibling lock path (``<cache>.lock``) stays beside the cache whatever the
+    process working directory is.
+    """
+    env_value = os.environ.get("XERO_TOKEN_FILE")
+    if env_value is not None and env_value.strip():
+        return os.path.abspath(env_value)
+    if cli_value is not None and cli_value.strip():
+        return os.path.abspath(cli_value)
+    return DEFAULT_TOKEN_FILE
+
+
+# Module-level for the existing callers and tests that patch it. Entry points
+# that parse a command line or load .env re-resolve after doing so.
+TOKEN_FILE = resolve_token_file()
 
 # Windows token caches are JSON envelopes whose payload is protected for the
 # current Windows user by DPAPI.  Keep these values explicit: a future format

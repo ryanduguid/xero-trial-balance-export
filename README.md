@@ -29,7 +29,7 @@ See [`samples/sample-output.csv`](samples/sample-output.csv) for the exact outpu
 python export_tb.py --date 2026-06-30
 ```
 
-Options: `--tenant "name"` (substring match when multiple orgs are connected), `--out relative/path.csv`, `--payments-only` (cash basis). `--out` must be a `.csv` path beneath the process working directory; absolute paths outside the working directory, `..` traversal and paths through an existing symlink that escapes that directory are rejected. A missing parent directory under `--out` is created rather than refused (`--out exports/tb.csv` makes `exports/` if it is not there), so a fetched report is never thrown away for want of a folder. Default filename: `{tenant}-{tenantid8}-tb-{date}-{accrual|cash}.csv`, so the two bases never overwrite each other. The `{tenant}` segment is the org name lowercased, with every run of characters other than **ASCII** letters, digits, `.`, `_` and `-` collapsed to a single `-` and any leading or trailing `-` trimmed; everything outside ASCII is dropped like punctuation: a macron, an accent, Cyrillic, Chinese, an emoji. That transform also folds case and ASCII punctuation, so it can put two different orgs on one name: "Acme (Holdings) Pty Ltd" and "Acme Holdings Pty Ltd" both sanitise to `acme-holdings-pty-ltd`, "ACME Pty Ltd" and "Acme Pty Ltd" both to `acme-pty-ltd`, and two orgs whose names differ only in their Chinese characters both to `pty-ltd`. The first eight characters of the tenant ID are therefore appended to **every** default filename (sanitised the same way, so the default filename is always one path segment), so "Demo Company (AU)" writes `demo-company-au-{tenantid8}-tb-2026-06-30-accrual.csv`. The tenant ID is used because it is the only value Xero guarantees is distinct per organisation, and nothing narrower keeps two clients' trial balances apart. The name is composed to NFC first, so the same org name typed decomposed writes the same file. An org name that sanitises away to nothing leaves the tenant ID as the whole segment. Every default filename **changed** with this rule, so a refresh pointed at an old default path will keep reading a file nothing writes any more. Pin the destination with `--out`.
+Options: `--tenant "name"` (substring match when multiple orgs are connected), `--out relative/path.csv`, `--payments-only` (cash basis), `--token-file path/to/token.json` (where the token cache lives; the `XERO_TOKEN_FILE` environment variable takes precedence, and the default is `token.json` beside `xero_client.py`). `--out` must be a `.csv` path beneath the process working directory; absolute paths outside the working directory, `..` traversal and paths through an existing symlink that escapes that directory are rejected. A missing parent directory under `--out` is created rather than refused (`--out exports/tb.csv` makes `exports/` if it is not there), so a fetched report is never thrown away for want of a folder. Default filename: `{tenant}-{tenantid8}-tb-{date}-{accrual|cash}.csv`, so the two bases never overwrite each other. The `{tenant}` segment is sanitised for filesystem safety; see the [Filename reference](#filename-reference) appendix for the exact rules and their edge cases.
 
 Every export runs a balance check before anything touches disk. Both pairs must balance (movement **and** YTD), and the expected report columns must all be present; otherwise no file is written and the script exits non-zero, so a truncated or reshaped report can never slip into a refresh pipeline.
 
@@ -40,6 +40,26 @@ The CSV is written as UTF-8 with a BOM (`utf-8-sig`): Excel's double-click open 
 Get Data → Text/CSV → point at the export. Columns arrive typed and tidy; `Section` and `AccountCode` are ready for slicers and drill-downs. For a zero-click refresh, set the scheduled task's working directory (Windows **Start in**, or cron's `cd`) to the fixed Power BI data directory, then schedule `export_tb.py` with an explicit `--tenant` and relative `--out`, e.g. from `C:\data`: `python C:\path\to\export_tb.py --tenant "Org Name" --out tb-latest.csv`. Run the Windows task in the same Windows user profile that ran `auth.py`: current-user DPAPI is deliberately not a portable cache format, and a non-Windows process cannot decrypt it. The default filename embeds the report date, so a bare scheduled run writes a new file every day while Power BI keeps refreshing the stale one from setup day. Concurrent exports using the same checkout serialise their token-cache read, migration, refresh and write through `token.json.lock`; a waiter re-reads the rotated cache instead of spending the same refresh token. The lock coordinates processes using that local cache, not copies of `token.json` on other machines. If the destination CSV is locked when the export finishes (Excel or Power BI Desktop holding it open), the run retries briefly, then exits non-zero and leaves the finished export beside it as a `*.csv.tmp`, naming that file in the error. Rename it into place rather than re-running, because the report has already been fetched and a re-run spends another refresh token. A disk that refuses the final flush is handled the same way: once the rows are written the `*.csv.tmp` is complete and balance-checked, so it is kept and named in the error instead of being deleted. Nothing deletes those files, so a scheduled job against a destination that stays locked leaves one per run.
 
 Two Xero platform limits worth knowing: uncertified apps connect to at most 25 organisations (the Demo Company doesn't count), and going past that requires App Partner certification.
+
+## Scheduled runs
+
+Point the job at a stable token cache first. The cache defaults to `token.json` beside `xero_client.py`, `--token-file` overrides that, and the `XERO_TOKEN_FILE` environment variable overrides both, so a move of the checkout cannot orphan the cache. The lock file (`<cache>.lock`) always sits beside whichever cache path wins. Run the job as the same user that ran `auth.py` (on Windows this is mandatory: the DPAPI cache only decrypts under that user's profile).
+
+Exit codes: `0` means the export succeeded and the CSV is in place. `1` means the run failed and printed a one-line reason (most failures report on stderr; the balance-check warnings print on stdout, so capture both streams). `2` means a command-line error (a malformed `--date`, an `--out` outside the working directory). Any non-zero exit writes no CSV to the destination, though a locked destination leaves the finished export beside it as a named `*.csv.tmp`.
+
+cron (Linux or macOS), daily at 06:30, with both streams appended to a log:
+
+```cron
+30 6 * * * cd /srv/powerbi-data && XERO_TOKEN_FILE=/srv/xero/token.json /usr/bin/python3 /opt/xero-trial-balance-export/export_tb.py --tenant "Org Name" --out tb-latest.csv >> /var/log/xero-export.log 2>&1
+```
+
+Windows Task Scheduler: create a task that runs as the Windows user who ran `auth.py`, with "Start in" set to the Power BI data directory. Action program: `cmd.exe`. Arguments:
+
+```
+/c ""C:\Python313\python.exe" "C:\tools\xero-trial-balance-export\export_tb.py" --tenant "Org Name" --out tb-latest.csv --token-file "C:\xero\token.json" >> "C:\logs\xero-export.log" 2>&1"
+```
+
+Task Scheduler records the exit code as the task's "Last Run Result", so a `1` or `2` there means read the log. The `>>` redirection is what captures the one-line error messages; without it a failed scheduled run leaves nothing to read.
 
 ## The refresh-token gotcha
 
@@ -71,6 +91,10 @@ repository root:
 ```bash
 python -B -m unittest discover -s tests -v
 ```
+
+## Filename reference
+
+The `{tenant}` segment of the default filename is the org name lowercased, with every run of characters other than **ASCII** letters, digits, `.`, `_` and `-` collapsed to a single `-` and any leading or trailing `-` trimmed; everything outside ASCII is dropped like punctuation: a macron, an accent, Cyrillic, Chinese, an emoji. That transform also folds case and ASCII punctuation, so it can put two different orgs on one name: "Acme (Holdings) Pty Ltd" and "Acme Holdings Pty Ltd" both sanitise to `acme-holdings-pty-ltd`, "ACME Pty Ltd" and "Acme Pty Ltd" both to `acme-pty-ltd`, and two orgs whose names differ only in their Chinese characters both to `pty-ltd`. The first eight characters of the tenant ID are therefore appended to **every** default filename (sanitised the same way, so the default filename is always one path segment), so "Demo Company (AU)" writes `demo-company-au-{tenantid8}-tb-2026-06-30-accrual.csv`. The tenant ID is used because it is the only value Xero guarantees is distinct per organisation, and nothing narrower keeps two clients' trial balances apart. The name is composed to NFC first, so the same org name typed decomposed writes the same file. An org name that sanitises away to nothing leaves the tenant ID as the whole segment. Every default filename **changed** with this rule, so a refresh pointed at an old default path will keep reading a file nothing writes any more. Pin the destination with `--out`.
 
 ## Related
 

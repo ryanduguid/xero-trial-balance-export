@@ -35,6 +35,7 @@ from dotenv import load_dotenv
 # REPLACE_BACKOFF and the time import above have no callers left in this
 # module, but the durable-write tests reach both through export_tb (reading
 # the backoff, patching time.sleep), so they stay.
+import xero_client
 from xero_client import REPLACE_ATTEMPTS, REPLACE_BACKOFF, api_get, durable_replace, get_connections
 
 REPORT_URL = "https://api.xero.com/api.xro/2.0/Reports/TrialBalance"
@@ -601,6 +602,15 @@ def main() -> None:
         help="Output CSV path relative to the current working directory",
     )
     parser.add_argument("--payments-only", action="store_true", help="Cash-basis report")
+    parser.add_argument(
+        "--token-file",
+        default=None,
+        help=(
+            "Path to the token cache (token.json). The XERO_TOKEN_FILE "
+            "environment variable takes precedence; the default is "
+            "token.json beside xero_client.py."
+        ),
+    )
     args = parser.parse_args()
 
     # Reject unsafe explicit destinations before looking up credentials or
@@ -613,6 +623,10 @@ def main() -> None:
             parser.error(str(exc))
 
     load_dotenv()
+    # Re-resolve after load_dotenv: a XERO_TOKEN_FILE set in .env is not in
+    # the environment when xero_client is imported, and --token-file is only
+    # known now.
+    xero_client.TOKEN_FILE = xero_client.resolve_token_file(args.token_file)
     client_id = os.environ.get("XERO_CLIENT_ID")
     client_secret = os.environ.get("XERO_CLIENT_SECRET")
     if not client_id or not client_secret:

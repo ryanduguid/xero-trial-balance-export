@@ -7,6 +7,7 @@ import unicodedata
 import unittest
 from contextlib import redirect_stdout
 from decimal import Decimal
+from pathlib import Path
 from unittest import mock
 from unittest.mock import patch
 
@@ -1299,6 +1300,62 @@ class TenantSelectionTest(unittest.TestCase):
         self.assertIn("Acme Trading Pty Ltd", message)
         api_get.assert_not_called()
 
+    def test_an_exact_tenant_id_wins_over_a_name_substring(self):
+        """A display name can contain another org's tenantId token. The
+        exact id match must win, or --tenant cannot disambiguate twins."""
+        connections = [
+            {"tenantId": "Holdings", "tenantName": "Acme Trading Pty Ltd"},
+            {"tenantId": "bbbb", "tenantName": "Acme Holdings Pty Ltd"},
+        ]
+        chosen = export_tb.select_tenant(connections, "Holdings")
+        self.assertEqual(chosen["tenantId"], "Holdings")
+        self.assertEqual(chosen["tenantName"], "Acme Trading Pty Ltd")
+        chosen = export_tb.select_tenant(connections, "holdings")
+        self.assertEqual(chosen["tenantId"], "Holdings")
+
+    def test_duplicate_display_names_are_selectable_by_tenant_id(self):
+        connections = [
+            {"tenantId": "aaaa-aaaa", "tenantName": "Acme Pty Ltd"},
+            {"tenantId": "bbbb-bbbb", "tenantName": "Acme Pty Ltd"},
+        ]
+        with self.assertRaises(SystemExit) as ctx:
+            export_tb.select_tenant(connections, "Acme")
+        self.assertIn("matches more than one organisation", str(ctx.exception))
+        chosen = export_tb.select_tenant(connections, "BBBB-BBBB")
+        self.assertEqual(chosen["tenantId"], "bbbb-bbbb")
+
+    def test_an_exact_tenant_id_selects_through_the_cli(self):
+        connections = [
+            {"tenantId": "aaaa-aaaa", "tenantName": "Acme Pty Ltd"},
+            {"tenantId": "bbbb-bbbb", "tenantName": "Acme Pty Ltd"},
+        ]
+        work_dir = tempfile.mkdtemp()
+        argv = [
+            "export_tb.py", "--date", "2026-06-30", "--out", "tb.csv",
+            "--tenant", "aaaa-aaaa",
+        ]
+        env = {
+            "XERO_CLIENT_ID": "id-not-a-secret",
+            "XERO_CLIENT_SECRET": "secret-not-used",
+        }
+        payload = _report([("Cash (090)", "1.00", "", "1.00", ""),
+                           ("Equity (960)", "", "1.00", "", "1.00")])
+        previous_dir = os.getcwd()
+        os.chdir(work_dir)
+        buffer = io.StringIO()
+        try:
+            with mock.patch.object(export_tb, "load_dotenv", lambda *a, **k: None), \
+                    mock.patch.object(export_tb, "get_connections", return_value=connections), \
+                    mock.patch.object(export_tb, "api_get", return_value=payload) as api_get, \
+                    mock.patch.dict(os.environ, env, clear=False), \
+                    mock.patch.object(sys, "argv", argv):
+                with redirect_stdout(buffer):
+                    export_tb.main()
+        finally:
+            os.chdir(previous_dir)
+        self.assertEqual(api_get.call_args.kwargs["tenant_id"], "aaaa-aaaa")
+        self.assertIn("Tenant: Acme Pty Ltd", buffer.getvalue())
+
 
 class StreamEncodingTest(unittest.TestCase):
     """Non-console stdout on Windows is cp1252 (PEP 528), so a macron or a
@@ -1382,6 +1439,25 @@ class TransportFailureTest(unittest.TestCase):
         with mock.patch.object(export_tb, "main") as main_fn:
             export_tb.run()
         main_fn.assert_called_once_with()
+
+    def test_the_packaged_console_script_calls_the_transport_wrapper(self):
+        text = (Path(__file__).resolve().parents[1] / "pyproject.toml").read_text(
+            encoding="utf-8"
+        )
+        self.assertRegex(text, r'(?m)^export-tb = "export_tb:run"$')
+        self.assertNotRegex(text, r'(?m)^export-tb = "export_tb:main"$')
+
+    def test_token_file_help_says_the_flag_beats_the_environment(self):
+        with mock.patch.object(sys, "argv", ["export_tb.py", "--help"]):
+            buffer = io.StringIO()
+            with redirect_stdout(buffer):
+                with self.assertRaises(SystemExit) as ctx:
+                    export_tb.main()
+        self.assertEqual(ctx.exception.code, 0)
+        help_text = " ".join(buffer.getvalue().split())
+        self.assertNotIn("environment variable takes precedence", help_text)
+        self.assertIn("flag takes precedence", help_text)
+        self.assertIn("exact tenantId", help_text)
 
 
 class IsoDateTest(unittest.TestCase):

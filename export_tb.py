@@ -389,16 +389,29 @@ def select_tenant(connections: list[dict], tenant_arg: str | None) -> dict:
     """Resolve exactly one organisation to export, or exit naming the choices.
 
     A bare multi-organisation run is refused on purpose: silently picking
-    the first connection can export the wrong entity.
+    the first connection can export the wrong entity. An exact tenantId
+    match (case-insensitive) wins over a name substring, so two orgs that
+    share a display name remain selectable.
     """
     if tenant_arg:
-        matches = [c for c in connections if tenant_arg.lower() in c["tenantName"].lower()]
+        needle = tenant_arg.lower()
+        id_matches = [c for c in connections if needle == str(c["tenantId"]).lower()]
+        if len(id_matches) == 1:
+            return id_matches[0]
+        if len(id_matches) > 1:
+            names = ", ".join(c["tenantName"] for c in id_matches)
+            sys.exit(
+                f'"{tenant_arg}" matches more than one organisation ({names}) - narrow it.'
+            )
+        matches = [c for c in connections if needle in c["tenantName"].lower()]
         if not matches:
             names = ", ".join(c["tenantName"] for c in connections)
             sys.exit(f'No tenant matching "{tenant_arg}". Connected: {names}')
         if len(matches) > 1:
             names = ", ".join(c["tenantName"] for c in matches)
-            sys.exit(f'"{tenant_arg}" matches more than one organisation ({names}) - narrow it.')
+            sys.exit(
+                f'"{tenant_arg}" matches more than one organisation ({names}) - narrow it.'
+            )
         return matches[0]
     if len(connections) > 1:
         names = ", ".join(c["tenantName"] for c in connections)
@@ -591,7 +604,11 @@ def main() -> None:
 
     parser = argparse.ArgumentParser(description="Export a Xero Trial Balance to CSV.")
     parser.add_argument("--date", type=iso_date, default=date.today().isoformat(), help="Report date YYYY-MM-DD")
-    parser.add_argument("--tenant", default=None, help="Tenant name substring (required when multiple orgs are connected)")
+    parser.add_argument(
+        "--tenant",
+        default=None,
+        help="Tenant name substring or exact tenantId (required when multiple orgs are connected)",
+    )
     parser.add_argument(
         "--out",
         default=None,
@@ -602,9 +619,9 @@ def main() -> None:
         "--token-file",
         default=None,
         help=(
-            "Path to the token cache (token.json). The XERO_TOKEN_FILE "
-            "environment variable takes precedence; the default is "
-            "token.json beside xero_client.py."
+            "Path to the token cache (token.json). This flag takes "
+            "precedence over the XERO_TOKEN_FILE environment variable; "
+            "the default is token.json beside xero_client.py."
         ),
     )
     args = parser.parse_args()

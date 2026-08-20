@@ -29,7 +29,7 @@ Homepage = "https://github.com/ryanduguid/xero-trial-balance-export"
 Issues = "https://github.com/ryanduguid/xero-trial-balance-export/issues"
 
 [project.scripts]
-export-tb = "export_tb:main"
+export-tb = "export_tb:run"
 xero-tb-auth = "auth:main"
 
 [tool.setuptools]

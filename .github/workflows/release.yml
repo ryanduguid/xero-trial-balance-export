@@ -14,6 +14,7 @@ concurrency:
 
 jobs:
   release:
+    timeout-minutes: 15
     name: build, attest and publish
     runs-on: ubuntu-latest
     permissions:
@@ -255,6 +256,7 @@ jobs:
           done
 
   pypi:
+    timeout-minutes: 15
     name: publish to PyPI
     needs: release
     runs-on: ubuntu-latest

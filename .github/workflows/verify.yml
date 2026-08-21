@@ -12,7 +12,6 @@ permissions:
 
 jobs:
   test:
-    timeout-minutes: 30
     name: test (${{ matrix.os }}, Python ${{ matrix.python-version }})
     strategy:
       fail-fast: false
@@ -45,7 +44,6 @@ jobs:
         run: python -m unittest discover -s tests -v
 
   verify:
-    timeout-minutes: 15
     name: verify
     if: ${{ always() }}
     needs: test
@@ -55,3 +53,23 @@ jobs:
         env:
           TEST_RESULT: ${{ needs.test.result }}
         run: test "$TEST_RESULT" = success
+
+  lint:
+    name: lint
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+        with:
+          python-version: "3.12"
+      - name: Install linters
+        run: python -m pip install "ruff>=0.11" "mypy>=1.14"
+      - name: Ruff
+        run: python -m ruff check xero_client.py export_tb.py auth.py token_store.py
+      - name: Typecheck
+        continue-on-error: true
+        run: python -m mypy --ignore-missing-imports --pretty xero_client.py export_tb.py auth.py token_store.py

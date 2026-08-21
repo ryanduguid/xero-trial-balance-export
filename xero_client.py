@@ -29,39 +29,18 @@ from ctypes import wintypes
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
+from pathlib import Path
+from typing import Any, cast
 
 import requests
 
 TOKEN_URL = "https://identity.xero.com/connect/token"
 CONNECTIONS_URL = "https://api.xero.com/connections"
-# The historical cache location: next to this module. Kept as the fallback so
-# existing installs keep reading the token.json they already have.
-DEFAULT_TOKEN_FILE = os.path.join(
-    os.path.dirname(os.path.abspath(__file__)), "token.json"
+from token_store import (  # noqa: E402
+    DEFAULT_TOKEN_FILE,
+    resolve_token_file,
 )
 
-
-def resolve_token_file(cli_value: str | None = None) -> str:
-    """Resolve the token cache path.
-
-    Order: an explicit command-line value (export_tb.py's --token-file),
-    then the XERO_TOKEN_FILE environment variable, then the module-relative
-    default. An operator who passes the flag gets exactly the cache they
-    asked for; a scheduled job that sets only the environment variable is
-    unaffected. The result is absolute, so the sibling lock path
-    (``<cache>.lock``) stays beside the cache whatever the process working
-    directory is.
-    """
-    if cli_value is not None and cli_value.strip():
-        return os.path.abspath(cli_value)
-    env_value = os.environ.get("XERO_TOKEN_FILE")
-    if env_value is not None and env_value.strip():
-        return os.path.abspath(env_value)
-    return DEFAULT_TOKEN_FILE
-
-
-# Module-level for the existing callers and tests that patch it. Entry points
-# that parse a command line or load .env re-resolve after doing so.
 TOKEN_FILE = resolve_token_file()
 
 # Windows token caches are JSON envelopes whose payload is protected for the
@@ -159,8 +138,10 @@ def _windows_dpapi(function_name: str, data: bytes) -> bytes:
     )
     output_blob = _DataBlob()
 
-    crypt32 = ctypes.WinDLL("crypt32", use_last_error=True)
-    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    # POSIX ctypes stubs omit WinDLL; both exist at runtime on Windows.
+    windll = getattr(ctypes, "WinDLL")
+    crypt32 = windll("crypt32", use_last_error=True)
+    kernel32 = windll("kernel32", use_last_error=True)
     function = getattr(crypt32, function_name)
     function.argtypes = [
         ctypes.POINTER(_DataBlob),
@@ -187,7 +168,7 @@ def _windows_dpapi(function_name: str, data: bytes) -> bytes:
         CRYPTPROTECT_UI_FORBIDDEN,
         ctypes.byref(output_blob),
     ):
-        error = ctypes.get_last_error()
+        error = getattr(ctypes, "get_last_error")()
         if function_name == "CryptUnprotectData":
             raise SystemExit(
                 "error: token.json's DPAPI payload is corrupt or cannot be "
@@ -332,7 +313,8 @@ def _try_token_lock(lock_file) -> bool:
         if os.name == "nt":
             import msvcrt
 
-            msvcrt.locking(lock_file.fileno(), msvcrt.LK_NBLCK, 1)
+            win_msvcrt = cast(Any, msvcrt)
+            win_msvcrt.locking(lock_file.fileno(), win_msvcrt.LK_NBLCK, 1)
         else:
             import fcntl
 
@@ -349,7 +331,8 @@ def _release_token_lock(lock_file) -> None:
     if os.name == "nt":
         import msvcrt
 
-        msvcrt.locking(lock_file.fileno(), msvcrt.LK_UNLCK, 1)
+        win_msvcrt = cast(Any, msvcrt)
+        win_msvcrt.locking(lock_file.fileno(), win_msvcrt.LK_UNLCK, 1)
     else:
         import fcntl
 
@@ -359,8 +342,21 @@ def _release_token_lock(lock_file) -> None:
 @contextmanager
 def _token_cache_lock():
     """Hold the cross-process lock for TOKEN_FILE's cache transaction."""
-    lock_path = f"{TOKEN_FILE}.lock"
+    token_file = os.path.realpath(os.path.abspath(TOKEN_FILE))
+    allowed_roots = (
+        os.path.realpath(os.path.abspath(os.path.expanduser("~"))),
+        os.path.realpath(os.path.abspath(os.getcwd())),
+        os.path.realpath(os.path.abspath(tempfile.gettempdir())),
+        os.path.realpath(os.path.abspath(os.path.dirname(__file__))),
+    )
+    if os.path.basename(token_file) != "token.json" or not any(
+        token_file == root or token_file.startswith(root + os.sep)
+        for root in allowed_roots
+    ):
+        raise SystemExit("error: token cache path is not allowed.")
+    lock_path = token_file + ".lock"
     try:
+        os.makedirs(os.path.dirname(token_file) or ".", exist_ok=True)
         lock_file = open(lock_path, "a+b")
     except OSError as exc:
         raise SystemExit(
@@ -449,17 +445,17 @@ def validate_token_response(payload: object, *, label: str, cached: bool = False
     validate_rotated_response instead, which never throws that pair away over
     a cache hint.
     """
-    _require_token_pair(payload, label=label)
-    if not _expires_in_is_usable(payload.get("expires_in")):
+    tokens = _require_token_pair(payload, label=label)
+    if not _expires_in_is_usable(tokens.get("expires_in")):
         raise SystemExit(f"error: {label} has an invalid expires_in; no token was saved.")
     if cached:
-        obtained_at = payload.get("obtained_at")
+        obtained_at = tokens.get("obtained_at")
         if (
             type(obtained_at) not in (int, float)
-            or not 0 <= obtained_at < 100_000_000_000
+            or not 0 <= cast(float, obtained_at) < 100_000_000_000
         ):
             raise SystemExit("error: token.json has an invalid obtained_at; run: python auth.py")
-    return payload
+    return tokens
 
 
 def retry_after_seconds(value: str | None, *, now: datetime | None = None) -> int:
@@ -753,7 +749,7 @@ def api_get(
     credentials: tuple[str, str],
     tenant_id: str | None = None,
     params: dict | None = None,
-) -> dict:
+) -> object:
     """GET a Xero API URL with auth headers. One capped retry on 429.
 
     The 429 wait comes from a server-supplied Retry-After, so it is parsed
@@ -821,4 +817,7 @@ def api_get(
 
 def get_connections(credentials: tuple[str, str]) -> list[dict]:
     """Authorised tenants: [{tenantId, tenantName, ...}, ...]."""
-    return api_get(CONNECTIONS_URL, credentials)
+    payload = api_get(CONNECTIONS_URL, credentials)
+    if not isinstance(payload, list):
+        raise SystemExit("error: Xero connections response is not a list.")
+    return payload

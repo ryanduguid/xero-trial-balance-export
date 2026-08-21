@@ -2,9 +2,9 @@
 > High-density context for LLM agents, BI developers, and data integration pipelines.
 
 ## Package Overview
-- **Repository**: https://github.com/ryanduguid/xero-trial-balance-export (JohnSpenceOgilvy)
+- **Repository**: https://github.com/ryanduguid/JohnSpenceOgilvy
 - **CLI Commands**: `export-tb`, `xero-tb-auth`
-- **Domain**: Production-grade CLI and Python library for extracting reconciled Xero trial balances via OAuth 2.0 into structured, validated CSV formats for Power BI, Excel, and pandas.
+- **Domain**: Read-only CLI and Python utility for exporting Xero trial balances via OAuth 2.0 into structured, validated CSV files for Power BI, Excel, and pandas.
 - **Standards**: Xero API OAuth 2.0 Authorization Code Flow with PKCE, double-entry trial balance movement gates.
 
 ## Core Modules & APIs
@@ -13,4 +13,4 @@
 - `export_tb`: Core extractor enforcing the movement and year-to-date mathematical balance gate before CSV generation.
 
 ## Architectural Invariants
-1. **Balance Gate Integrity**: Never outputs a CSV file unless debits equal credits and period movement reconciles precisely to the opening/closing year-to-date balances.
+1. **Balance Gate Integrity**: Never writes a CSV file unless the current-month Debit/Credit totals and the year-to-date YTDDebit/YTDCredit totals each balance and all required report columns are present.

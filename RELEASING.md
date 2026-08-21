@@ -4,7 +4,7 @@ Releases are built by GitHub Actions from an annotated tag on the exact `main` c
 
 ## Protected v0.1.2 failed tag
 
-The annotated `v0.1.2` tag is protected and permanently records commit `bd4cd417b06fb9dba3d6b36fbedbe544b1e0fec7`. [Release workflow run 31832080223](https://github.com/ryanduguid/xero-trial-balance-export/actions/runs/31832080223) completed the tests, deterministic archives, checksums and both attestation steps, then failed safely at the immediate remote recheck because that GitHub CLI step did not receive `GH_TOKEN`. The publication step was skipped, and the authenticated release inventory confirmed that no v0.1.2 release or draft exists.
+The annotated `v0.1.2` tag is protected and permanently records commit `bd4cd417b06fb9dba3d6b36fbedbe544b1e0fec7`. [Release workflow run 31832080223](https://github.com/ryanduguid/JohnSpenceOgilvy/actions/runs/31832080223) completed the tests, deterministic archives, checksums and both attestation steps, then failed safely at the immediate remote recheck because that GitHub CLI step did not receive `GH_TOKEN`. The publication step was skipped, and the authenticated release inventory confirmed that no v0.1.2 release or draft exists.
 
 Do not move, delete or reuse `v0.1.2`. The no-bypass tag ruleset prevents those operations; `v0.1.3` is the recovery version.
 
@@ -15,16 +15,16 @@ Before tagging:
 3. From an operator session authenticated with repository Administration read access, run:
 
     ```bash
-    gh api -H "X-GitHub-Api-Version: 2026-03-10" repos/ryanduguid/xero-trial-balance-export/immutable-releases --jq .enabled
+    gh api -H "X-GitHub-Api-Version: 2026-03-10" repos/ryanduguid/JohnSpenceOgilvy/immutable-releases --jq .enabled
     ```
 
     Do not push the tag unless the output is exactly `true`. The Actions `GITHUB_TOKEN` cannot be granted repository Administration read access, so the tag workflow cannot perform this preflight itself.
 4. Confirm the active `Protect version tags` ruleset matches `refs/tags/v*`, has no bypass actor, allows creation, and blocks tag updates and deletion:
 
     ```bash
-    ruleset_id="$(gh api -H "X-GitHub-Api-Version: 2026-03-10" repos/ryanduguid/xero-trial-balance-export/rulesets --jq '.[] | select(.name == "Protect version tags" and .target == "tag" and .enforcement == "active") | .id')"
+    ruleset_id="$(gh api -H "X-GitHub-Api-Version: 2026-03-10" repos/ryanduguid/JohnSpenceOgilvy/rulesets --jq '.[] | select(.name == "Protect version tags" and .target == "tag" and .enforcement == "active") | .id')"
     test -n "$ruleset_id"
-    gh api -H "X-GitHub-Api-Version: 2026-03-10" "repos/ryanduguid/xero-trial-balance-export/rulesets/$ruleset_id" --jq '{enforcement, bypass_actors, conditions, rules}'
+    gh api -H "X-GitHub-Api-Version: 2026-03-10" "repos/ryanduguid/JohnSpenceOgilvy/rulesets/$ruleset_id" --jq '{enforcement, bypass_actors, conditions, rules}'
     ```
 
     Stop unless the returned configuration has an empty `bypass_actors` array, includes only `refs/tags/v*`, and contains active `update` and `deletion` rules but no `creation` rule. This protection is required because immutable-release protection begins only when a draft is published.
@@ -39,7 +39,7 @@ Verify the downloaded release with:
 
 ```bash
 tag=v0.1.3
-repo=ryanduguid/xero-trial-balance-export
+repo=ryanduguid/JohnSpenceOgilvy
 release_commit="$(git ls-remote "https://github.com/$repo.git" "refs/tags/$tag^{}" | cut -f1)"
 test -n "$release_commit"
 gh release download "$tag" -R "$repo" --dir "release-$tag"
@@ -69,14 +69,16 @@ If any gate fails, inspect it before touching the draft. Never move, delete or r
 
 The `pypi` job in `release.yml` uploads the sdist and wheel to PyPI after the GitHub release job succeeds. It authenticates with OIDC trusted publishing, so the repository stores no PyPI API token. Until an owner registers the trusted publisher on PyPI, the job fails at the upload step without affecting the GitHub release.
 
+Because [PyPI matches the GitHub repository claim exactly](https://docs.pypi.org/trusted-publishers/troubleshooting/), any pending or existing publisher registered before the rename must be changed to the current repository name.
+
 Register the publisher once at PyPI under the project's Publishing settings (or as a pending publisher before the first upload) with exactly these values:
 
 | Field | Value |
 |---|---|
 | PyPI project name | `xero-trial-balance-export` |
 | Owner | `ryanduguid` |
-| Repository name | `xero-trial-balance-export` |
+| Repository name | `JohnSpenceOgilvy` |
 | Workflow name | `release.yml` |
 | Environment name | `pypi` |
 
-Also create the `pypi` environment in the repository settings and restrict it to protected tags, so a publish requires the same rulesets that guard `v*` tags.
+The repository's `pypi` environment permits only tags matching `v*.*.*`. Keep that restriction aligned with the release workflow and the ruleset that guards `v*` tags.

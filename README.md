@@ -1,10 +1,12 @@
-# xero-trial-balance-export
+# John Spence Ogilvy
 
 ![JohnSpenceOgilvy](assets/banner.svg)
 
 [![Verify](https://github.com/ryanduguid/JohnSpenceOgilvy/actions/workflows/verify.yml/badge.svg)](https://github.com/ryanduguid/JohnSpenceOgilvy/actions/workflows/verify.yml) [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE) [![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/downloads/)
 
 Pull a trial balance straight from the Xero API into a tidy CSV that Power BI (or pandas, or Excel) loads without cleanup. No SDK, no framework, just three readable Python files showing exactly how Xero OAuth2 works, including the part that breaks most scheduled scripts.
+
+The repository name is the public project identity; the `xero-trial-balance-export` distribution, `export-tb` command and `xero-trial-balance-export-token-cache` cache format remain compatibility identifiers.
 
 ## Why
 
@@ -57,13 +59,13 @@ Exit codes: `0` means the export succeeded and the CSV is in place. `1` means th
 cron (Linux or macOS), daily at 06:30, with both streams appended to a log:
 
 ```cron
-30 6 * * * cd /srv/powerbi-data && XERO_TOKEN_FILE=/srv/xero/token.json /usr/bin/python3 /opt/xero-trial-balance-export/export_tb.py --tenant "Org Name" --out tb-latest.csv >> /var/log/xero-export.log 2>&1
+30 6 * * * cd /srv/powerbi-data && XERO_TOKEN_FILE=/srv/xero/token.json /usr/bin/python3 /opt/JohnSpenceOgilvy/export_tb.py --tenant "Org Name" --out tb-latest.csv >> /var/log/xero-export.log 2>&1
 ```
 
 Windows Task Scheduler: create a task that runs as the Windows user who ran `auth.py`, with "Start in" set to the Power BI data directory. Action program: `cmd.exe`. Arguments:
 
 ```
-/c ""C:\Python313\python.exe" "C:\tools\xero-trial-balance-export\export_tb.py" --tenant "Org Name" --out tb-latest.csv --token-file "C:\xero\token.json" >> "C:\logs\xero-export.log" 2>&1"
+/c ""C:\Python313\python.exe" "C:\tools\JohnSpenceOgilvy\export_tb.py" --tenant "Org Name" --out tb-latest.csv --token-file "C:\xero\token.json" >> "C:\logs\xero-export.log" 2>&1"
 ```
 
 Task Scheduler records the exit code as the task's "Last Run Result", so a `1` or `2` there means read the log. The `>>` redirection is what captures the one-line error messages; without it a failed scheduled run leaves nothing to read.
@@ -113,7 +115,7 @@ The `{tenant}` segment of the default filename is the org name lowercased, with 
 
 ## Related
 
-[`accounting-excel-toolkit`](https://github.com/ryanduguid/accounting-excel-toolkit): Power Query parsers for the manual-export path, when API access isn't on the table.
+[`SirAlexanderFitzgerald`](https://github.com/ryanduguid/SirAlexanderFitzgerald): Power Query parsers for the manual-export path, when API access isn't on the table.
 
 ## Author
 

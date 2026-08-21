@@ -30,9 +30,14 @@ from xero_client import save_tokens, validate_rotated_response
 
 AUTHORIZE_URL = "https://login.xero.com/identity/connect/authorize"
 TOKEN_URL = "https://identity.xero.com/connect/token"
-# Granular scope: required for apps created on or after 2 March 2026.
-# (The old broad accounting.reports.read only works on pre-existing apps
-# and retires in September 2027.)
+# Web and PKCE apps created on or after 2 March 2026 use granular scopes.
+# Existing apps using accounting.reports.read must migrate by 13 September 2027.
+# This exporter needs only offline_access and accounting.reports.trialbalance.read.
+# Xero contract checked 2026-08-20 (20 August 2026):
+# https://developer.xero.com/documentation/guides/oauth2/scopes/
+# https://developer.xero.com/faq/granular-scopes
+# https://developer.xero.com/changelog
+# Recheck these pages for apps created or used after that date.
 SCOPES = "offline_access accounting.reports.trialbalance.read"
 
 # An RFC 6749 error code is a single ASCII word. The callback query is

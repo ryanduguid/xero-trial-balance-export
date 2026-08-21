@@ -30,6 +30,7 @@ clients/
 !samples/sample-*.csv
 !samples/**/sample-*.csv
 !requirements.txt
+!llms.txt
 
 # Python
 __pycache__/

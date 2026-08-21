@@ -35,6 +35,14 @@ python export_tb.py --date 2026-06-30
 
 Options: `--tenant "name-or-id"` (name substring, or an exact `tenantId` when display names collide), `--out relative/path.csv`, `--payments-only` (cash basis), `--token-file path/to/token.json` (where the token cache lives; the flag beats the `XERO_TOKEN_FILE` environment variable, and the default is `token.json` beside `xero_client.py`). `--out` must be a `.csv` path beneath the process working directory; absolute paths outside the working directory, `..` traversal and paths through an existing symlink that escapes that directory are rejected. A missing parent directory under `--out` is created rather than refused (`--out exports/tb.csv` makes `exports/` if it is not there), so a fetched report is never thrown away for want of a folder. Default filename: `{tenant}-{tenantid8}-tb-{date}-{accrual|cash}.csv`, so the two bases never overwrite each other. The `{tenant}` segment is sanitised for filesystem safety; see the [Filename reference](#filename-reference) appendix for the exact rules and their edge cases.
 
+`--date` is an as-at date, not a range. Xero's `Reports/TrialBalance` endpoint takes
+only `date` and `paymentsOnly`, so this tool reproduces the `Trial Balance` report and
+cannot reproduce `Trial Balance by Date Range`. That second report exists in the Xero
+UI only; export it by hand if you need it. The `Debit`/`Credit` pair already gives you
+the movement for the month ending on `--date`, which covers the common reason people
+reach for a range. (Endpoint parameters checked against Xero's published OpenAPI
+specification on 22 August 2026.)
+
 Every export runs a balance check before anything touches disk. Both pairs must balance (movement **and** YTD), and the expected report columns must all be present; otherwise no file is written and the script exits non-zero, so a truncated or reshaped report can never slip into a refresh pipeline.
 
 The CSV is written as UTF-8 with a BOM (`utf-8-sig`): Excel's double-click open needs the BOM to decode non-ASCII account names correctly, and Power BI and pandas strip it automatically.

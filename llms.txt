@@ -9,8 +9,9 @@
 
 ## Core Modules & APIs
 - `auth`: Automated OAuth 2.0 authentication harness with token refresh lifecycle preservation.
-- `xero_client`: Resilient API client handling rate limiting, pagination, and multi-tenant organisation context.
+- `xero_client`: Resilient API client handling rate limiting, 401 retry after refresh, and multi-tenant organisation context. Trial Balance is a single report request; this client does not paginate.
 - `export_tb`: Core extractor enforcing the movement and year-to-date mathematical balance gate before CSV generation.
+- `token_store`: Resolves `token.json` (`--token-file`, `XERO_TOKEN_FILE`, existing module-adjacent file, then the per-user state directory).
 
 ## Architectural Invariants
 1. **Balance Gate Integrity**: Never writes a CSV file unless the current-month Debit/Credit totals and the year-to-date YTDDebit/YTDCredit totals each balance and all required report columns are present.

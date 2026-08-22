@@ -4,7 +4,7 @@
 
 [![Verify](https://github.com/ryanduguid/JohnSpenceOgilvy/actions/workflows/verify.yml/badge.svg)](https://github.com/ryanduguid/JohnSpenceOgilvy/actions/workflows/verify.yml) [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE) [![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/downloads/)
 
-Pull a trial balance straight from the Xero API into a tidy CSV that Power BI (or pandas, or Excel) loads without cleanup. No SDK, no framework, just three readable Python files showing exactly how Xero OAuth2 works, including the part that breaks most scheduled scripts.
+Pull a trial balance straight from the Xero API into a tidy CSV that Power BI (or pandas, or Excel) loads without cleanup. No SDK, no framework, just four readable Python files (`auth.py`, `xero_client.py`, `export_tb.py`, `token_store.py`) showing exactly how Xero OAuth2 works, including the part that breaks most scheduled scripts.
 
 The repository name is the public project identity; the `xero-trial-balance-export` distribution, `export-tb` command and `xero-trial-balance-export-token-cache` cache format remain compatibility identifiers.
 
@@ -33,7 +33,7 @@ See [`samples/sample-output.csv`](samples/sample-output.csv) for the exact outpu
 python export_tb.py --date 2026-06-30
 ```
 
-Options: `--tenant "name-or-id"` (name substring, or an exact `tenantId` when display names collide), `--out relative/path.csv`, `--payments-only` (cash basis), `--token-file path/to/token.json` (where the token cache lives; the flag beats the `XERO_TOKEN_FILE` environment variable, and the default is `token.json` beside `xero_client.py`). `--out` must be a `.csv` path beneath the process working directory; absolute paths outside the working directory, `..` traversal and paths through an existing symlink that escapes that directory are rejected. A missing parent directory under `--out` is created rather than refused (`--out exports/tb.csv` makes `exports/` if it is not there), so a fetched report is never thrown away for want of a folder. Default filename: `{tenant}-{tenantid8}-tb-{date}-{accrual|cash}.csv`, so the two bases never overwrite each other. The `{tenant}` segment is sanitised for filesystem safety; see the [Filename reference](#filename-reference) appendix for the exact rules and their edge cases.
+Options: `--tenant "name-or-id"` (name substring, or an exact `tenantId` when display names collide), `--out relative/path.csv`, `--payments-only` (cash basis), `--token-file path/to/token.json` (where the token cache lives; the flag beats the `XERO_TOKEN_FILE` environment variable, and the default is the per-user state directory — `~/.local/state/xero-trial-balance-export/token.json` on Unix, `%LOCALAPPDATA%\xero-trial-balance-export\token.json` on Windows. An existing `token.json` beside `xero_client.py` is still used so older clones keep working). `--out` must be a `.csv` path beneath the process working directory; absolute paths outside the working directory, `..` traversal and paths through an existing symlink that escapes that directory are rejected. A missing parent directory under `--out` is created rather than refused (`--out exports/tb.csv` makes `exports/` if it is not there), so a fetched report is never thrown away for want of a folder. Default filename: `{tenant}-{tenantid8}-tb-{date}-{accrual|cash}.csv`, so the two bases never overwrite each other. The `{tenant}` segment is sanitised for filesystem safety; see the [Filename reference](#filename-reference) appendix for the exact rules and their edge cases.
 
 `--date` is an as-at date, not a range. Xero's `Reports/TrialBalance` endpoint takes
 only `date` and `paymentsOnly`, so this tool reproduces the `Trial Balance` report and
@@ -60,7 +60,7 @@ Two Xero platform limits worth knowing: uncertified apps connect to at most 25 o
 
 ## Scheduled runs
 
-Point the job at a stable token cache first. The cache defaults to `token.json` beside `xero_client.py`, the `XERO_TOKEN_FILE` environment variable overrides that, and an explicit `--token-file` flag overrides both, so a move of the checkout cannot orphan the cache and an operator's flag always wins. The lock file (`<cache>.lock`) always sits beside whichever cache path wins. Run the job as the same user that ran `auth.py` (on Windows this is mandatory: the DPAPI cache only decrypts under that user's profile).
+Point the job at a stable token cache first. Resolution order is `--token-file`, then `XERO_TOKEN_FILE`, then an existing module-adjacent `token.json`, then the per-user state directory. Pin the path in a scheduled job so a checkout move cannot orphan the cache and an operator's flag always wins. The lock file (`<cache>.lock`) always sits beside whichever cache path wins. Run the job as the same user that ran `auth.py` (on Windows this is mandatory: the DPAPI cache only decrypts under that user's profile).
 
 Exit codes: `0` means the export succeeded and the CSV is in place. `1` means the run failed and printed a one-line reason (most failures report on stderr; the balance-check warnings print on stdout, so capture both streams). `2` means a command-line error (a malformed `--date`, an `--out` outside the working directory). Any non-zero exit writes no CSV to the destination, though a locked destination leaves the finished export beside it as a named `*.csv.tmp`.
 
@@ -91,6 +91,7 @@ Xero refresh tokens **rotate on use**: every refresh returns a replacement refre
 | [`auth.py`](auth.py) | One-time browser consent → `token.json` |
 | [`xero_client.py`](xero_client.py) | Token cache, rotation-safe refresh, authed GET with 429 and 401 retries |
 | [`export_tb.py`](export_tb.py) | Fetch report → flatten nested rows → CSV + balance check |
+| [`token_store.py`](token_store.py) | Resolves the cache path (flag, env, legacy module-adjacent file, then per-user state) |
 
 ## Scope and disclaimer
 

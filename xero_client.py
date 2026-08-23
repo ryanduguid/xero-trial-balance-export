@@ -29,7 +29,6 @@ from ctypes import wintypes
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
-from pathlib import Path
 from typing import Any, cast
 
 import requests

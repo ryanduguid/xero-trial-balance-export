@@ -1,4 +1,4 @@
-# John Spence Ogilvy
+# xero-trial-balance-export
 
 ![xero-trial-balance-export](assets/banner.svg)
 

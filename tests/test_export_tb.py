@@ -133,7 +133,7 @@ class _ExportCase(unittest.TestCase):
         date="2026-06-30",
         *,
         out="tb.csv",
-        tenant_name="Sample Trading Pty Ltd",
+        tenant_name="Catherby Fisheries Pty Ltd",
         tenant_id="tenant-guid",
         section="Assets",
         header=HEADER,
@@ -198,10 +198,10 @@ class CsvOutputTest(_ExportCase):
         expected = (
             b"\xef\xbb\xbfReportDate,Tenant,Section,AccountID,AccountName,"
             b"AccountCode,Debit,Credit,YTDDebit,YTDCredit\r\n"
-            b"2026-06-30,Sample Trading Pty Ltd,Assets,"
+            b"2026-06-30,Catherby Fisheries Pty Ltd,Assets,"
             b"00000000-0000-0000-0000-000000000001,Business Bank Account,090,"
             b"1200.0,0.0,15234.5,0.0\r\n"
-            b"2026-06-30,Sample Trading Pty Ltd,Assets,"
+            b"2026-06-30,Catherby Fisheries Pty Ltd,Assets,"
             b"00000000-0000-0000-0000-000000000002,Trade Debtors,610,"
             b"0.0,1200.0,0.0,15234.5\r\n"
         )
@@ -210,7 +210,7 @@ class CsvOutputTest(_ExportCase):
 
 class ReportShapeTest(unittest.TestCase):
     def test_a_malformed_reports_value_exits_cleanly_instead_of_raising(self):
-        connections = [{"tenantId": "tenant-guid", "tenantName": "Sample Trading Pty Ltd"}]
+        connections = [{"tenantId": "tenant-guid", "tenantName": "Catherby Fisheries Pty Ltd"}]
         env = {"XERO_CLIENT_ID": "id-not-a-secret", "XERO_CLIENT_SECRET": "secret-not-used"}
         for payload in (
             {"Reports": {"Rows": []}},
@@ -1125,7 +1125,7 @@ class NonStringCellExportTest(_ExportCase):
         self.assertTrue(message.startswith("error: "), message)
         self.assertIn("not text or a number", message)
         self.assertIn("API shape may have changed", message)
-        self.assertIn("Tenant: Sample Trading Pty Ltd", out)
+        self.assertIn("Tenant: Catherby Fisheries Pty Ltd", out)
         self.assertIsNone(data, "a report this script could not read reached disk")
 
 

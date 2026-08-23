@@ -17,11 +17,11 @@ FULL_SHA_REFERENCE = re.compile(r"^[^@]+@[0-9a-f]{40}$")
 
 
 class ReleaseWorkflowTests(unittest.TestCase):
-    def test_release_metadata_is_exactly_v013(self) -> None:
-        self.assertEqual("0.1.3\n", (ROOT / "VERSION").read_text(encoding="utf-8"))
+    def test_release_metadata_is_exactly_v014(self) -> None:
+        self.assertEqual("0.1.4\n", (ROOT / "VERSION").read_text(encoding="utf-8"))
         notes = RELEASE_NOTES.read_text(encoding="utf-8")
         self.assertTrue(
-            notes.startswith("# v0.1.3\n\nChanges since published `v0.1.1`:")
+            notes.startswith("# v0.1.4\n\nChanges since published `v0.1.3`:")
         )
 
     def test_notes_record_dpapi_and_plaintext_fallback_boundaries(self) -> None:

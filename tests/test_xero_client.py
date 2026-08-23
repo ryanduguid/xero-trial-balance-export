@@ -1048,5 +1048,52 @@ class ResolveTokenFileTest(unittest.TestCase):
             self.assertTrue(os.path.exists(cache_path + ".lock"))
 
 
+class TokenCacheLockGuardTest(unittest.TestCase):
+    """_token_cache_lock validates TOKEN_FILE through token_store.safe_token_path.
+
+    TOKEN_FILE is reassigned from --token-file, from XERO_TOKEN_FILE, and from
+    a XERO_TOKEN_FILE in .env, so the value reaching the lock is caller-supplied.
+    The guard has to run before os.makedirs and before the lock file is opened,
+    or a rejected path still leaves a directory behind.
+    """
+
+    def test_path_outside_every_allowed_root_is_refused(self):
+        outside = os.path.join(os.path.abspath(os.sep), *([os.pardir] * 12), "token.json")
+        with mock.patch.object(xero_client, "TOKEN_FILE", outside):
+            with self.assertRaises(SystemExit) as ctx:
+                with xero_client._token_cache_lock():
+                    pass
+        self.assertIn("must stay under", str(ctx.exception))
+
+    def test_cache_named_anything_but_token_json_is_refused(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            wrong_name = os.path.join(temp_dir, "cache.json")
+            with mock.patch.object(xero_client, "TOKEN_FILE", wrong_name):
+                with self.assertRaises(SystemExit) as ctx:
+                    with xero_client._token_cache_lock():
+                        pass
+        self.assertIn("must be named token.json", str(ctx.exception))
+
+    def test_a_refused_path_creates_no_directory_and_no_lock_file(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            unwanted_dir = os.path.join(temp_dir, "unwanted")
+            wrong_name = os.path.join(unwanted_dir, "cache.json")
+            with mock.patch.object(xero_client, "TOKEN_FILE", wrong_name):
+                with self.assertRaises(SystemExit):
+                    with xero_client._token_cache_lock():
+                        pass
+            self.assertFalse(os.path.exists(unwanted_dir))
+            self.assertFalse(os.path.exists(wrong_name + ".lock"))
+
+    def test_an_allowed_path_still_takes_the_lock_and_makes_its_directory(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            cache_path = os.path.join(temp_dir, "nested", "token.json")
+            with mock.patch.object(xero_client, "TOKEN_FILE", cache_path):
+                with xero_client._token_cache_lock():
+                    pass
+            self.assertTrue(os.path.isdir(os.path.dirname(cache_path)))
+            self.assertTrue(os.path.exists(cache_path + ".lock"))
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -38,6 +38,7 @@ CONNECTIONS_URL = "https://api.xero.com/connections"
 from token_store import (  # noqa: E402
     DEFAULT_TOKEN_FILE,
     resolve_token_file,
+    safe_token_path,
 )
 
 TOKEN_FILE = resolve_token_file()
@@ -340,19 +341,15 @@ def _release_token_lock(lock_file) -> None:
 
 @contextmanager
 def _token_cache_lock():
-    """Hold the cross-process lock for TOKEN_FILE's cache transaction."""
-    token_file = os.path.realpath(os.path.abspath(TOKEN_FILE))
-    allowed_roots = (
-        os.path.realpath(os.path.abspath(os.path.expanduser("~"))),
-        os.path.realpath(os.path.abspath(os.getcwd())),
-        os.path.realpath(os.path.abspath(tempfile.gettempdir())),
-        os.path.realpath(os.path.abspath(os.path.dirname(__file__))),
-    )
-    if os.path.basename(token_file) != "token.json" or not any(
-        token_file == root or token_file.startswith(root + os.sep)
-        for root in allowed_roots
-    ):
-        raise SystemExit("error: token cache path is not allowed.")
+    """Hold the cross-process lock for TOKEN_FILE's cache transaction.
+
+    TOKEN_FILE is reassigned by export_tb.py and auth.py after they parse a
+    command line and load .env, so it can still carry a --token-file value
+    or a XERO_TOKEN_FILE set in either place. Validate it here, through the
+    one validator in token_store, before any directory is created or any
+    file is opened from it.
+    """
+    token_file = safe_token_path(TOKEN_FILE)
     lock_path = token_file + ".lock"
     try:
         os.makedirs(os.path.dirname(token_file) or ".", exist_ok=True)

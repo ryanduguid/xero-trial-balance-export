@@ -109,6 +109,14 @@ class _CallbackServer(HTTPServer):
 
     allow_reuse_address = False
 
+    # Assigned by authorise() after construction and read by the handler and
+    # the post-callback checks; declared here so the attributes are part of
+    # the class contract instead of dynamic additions.
+    callback_path: str
+    auth_code: str | None
+    auth_error: str | None
+    returned_state: str | None
+
     def server_bind(self):
         exclusive = getattr(socket, "SO_EXCLUSIVEADDRUSE", None)
         if os.name == "nt" and exclusive is not None:

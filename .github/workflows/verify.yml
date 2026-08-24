@@ -71,5 +71,4 @@ jobs:
       - name: Ruff
         run: python -m ruff check xero_client.py export_tb.py auth.py token_store.py
       - name: Typecheck
-        continue-on-error: true
         run: python -m mypy --ignore-missing-imports --pretty xero_client.py export_tb.py auth.py token_store.py

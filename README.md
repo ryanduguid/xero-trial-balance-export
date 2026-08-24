@@ -1,5 +1,19 @@
 # xero-trial-balance-export
 
+```
++----------------------------------------------------------------------+
+|                      xero-trial-balance-export                       |
++----------------------------------------------------------------------+
+|             Export Xero trial balances to validated CSV              |
++----------------------------------+-----------------------------------+
+| DR  what it gives you            | CR  what it needs                 |
++----------------------------------+-----------------------------------+
+| tidy Xero TB CSV export          | a Xero app client ID secret       |
+| OAuth2 token refresh             | an as at date to export           |
+| balance check before write       | -                                 |
++----------------------------------+-----------------------------------+
+```
+
 ![xero-trial-balance-export](assets/banner.svg)
 
 [![Verify](https://github.com/ryanduguid/xero-trial-balance-export/actions/workflows/verify.yml/badge.svg)](https://github.com/ryanduguid/xero-trial-balance-export/actions/workflows/verify.yml) [![License: MIT](https://img.shields.io/badge/License-MIT-4F485E.svg?labelColor=04001F)](LICENSE) [![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-5C2D91.svg?logo=python&logoColor=white&labelColor=04001F)](https://www.python.org/downloads/)

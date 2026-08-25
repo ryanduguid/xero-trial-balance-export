@@ -8,6 +8,8 @@ Pull a trial balance straight from the Xero API into a tidy CSV that Power BI (o
 
 The repository name is the public project identity; the `xero-trial-balance-export` distribution, `export-tb` command and `xero-trial-balance-export-token-cache` cache format remain compatibility identifiers.
 
+For citation metadata, see [`CITATION.cff`](CITATION.cff) and the exact [`v0.1.4` release](https://github.com/ryanduguid/xero-trial-balance-export/releases/tag/v0.1.4). The API path is read-only and cannot write to the ledger; see [Scope and disclaimer](#scope-and-disclaimer) and the fabricated [`samples/sample-output.csv`](samples/sample-output.csv) output.
+
 ## Why
 
 The manual path (Reports → Trial Balance → Export → fix the header rows → fix the account codes) burns 10 minutes per entity per month and produces a slightly different file each time. The API path produces the same tidy shape every run:

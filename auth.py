@@ -23,10 +23,8 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.parse import urlencode, urlparse, parse_qs
 
 import requests
-from dotenv import load_dotenv
-
 import xero_client
-from xero_client import save_tokens, validate_rotated_response
+from xero_client import load_dotenv, save_tokens, validate_rotated_response
 
 AUTHORIZE_URL = "https://login.xero.com/identity/connect/authorize"
 TOKEN_URL = "https://identity.xero.com/connect/token"

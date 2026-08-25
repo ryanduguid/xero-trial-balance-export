@@ -1,0 +1,19 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it using the metadata below."
+title: xero-trial-balance-export
+type: software
+authors:
+  - family-names: Duguid
+    given-names: Ryan
+abstract: >-
+  Exports Xero trial balances through a read-only API path to tidy CSV for
+  Power BI, pandas and Excel.
+keywords:
+  - Xero
+  - trial balance
+  - accounting
+  - CSV
+license: MIT
+repository-code: "https://github.com/ryanduguid/xero-trial-balance-export"
+version: 0.1.4
+date-released: 2026-08-24

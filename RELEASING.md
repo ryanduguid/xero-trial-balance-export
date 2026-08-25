@@ -49,14 +49,14 @@ for file in *; do
   gh attestation verify "$file" -R "$repo" \
     --source-digest "$release_commit" \
     --source-ref "refs/tags/$tag" \
-    --signer-workflow "$repo/.github/workflows/release.yml"
+    --signer-workflow ryanduguid/release-policy/.github/workflows/release-archive.yml
   gh release verify-asset "$tag" "$file" -R "$repo"
 done
 gh attestation verify xero-trial-balance-export-0.1.3.zip -R "$repo" \
   --predicate-type https://spdx.dev/Document/v2.3 \
   --source-digest "$release_commit" \
   --source-ref "refs/tags/$tag" \
-  --signer-workflow "$repo/.github/workflows/release.yml"
+    --signer-workflow ryanduguid/release-policy/.github/workflows/release-archive.yml
 gh release view "$tag" -R "$repo" --json isImmutable,isLatest,tagName \
   | jq -e --arg tag "$tag" \
       '.isImmutable == true and .isLatest == true and .tagName == $tag'

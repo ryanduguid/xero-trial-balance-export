@@ -29,6 +29,7 @@ from ctypes import wintypes
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
+from pathlib import Path
 from typing import Any, cast
 
 import requests
@@ -42,6 +43,27 @@ from token_store import (  # noqa: E402
 )
 
 TOKEN_FILE = resolve_token_file()
+
+
+def load_dotenv(path: str | Path | None = None) -> None:
+    """Load KEY=VALUE lines from .env without overriding the process env."""
+    env_path = Path(path) if path is not None else Path(".env")
+    try:
+        text = env_path.read_text(encoding="utf-8")
+    except OSError:
+        return
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        key = key.strip()
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in {'"', "'"}:
+            value = value[1:-1]
+        if key:
+            os.environ.setdefault(key, value)
+
 
 # Windows token caches are JSON envelopes whose payload is protected for the
 # current Windows user by DPAPI.  Keep these values explicit: a future format

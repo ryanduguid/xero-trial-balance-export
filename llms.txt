@@ -15,3 +15,6 @@
 
 ## Architectural Invariants
 1. **Balance Gate Integrity**: Never writes a CSV file unless the current-month Debit/Credit totals and the year-to-date YTDDebit/YTDCredit totals each balance and all required report columns are present.
+
+## Offline evaluation
+- [`evaluation/xero_tb_integrity`](evaluation/xero_tb_integrity/README.md): Fabricated local fixtures that reproduce the movement and YTD balance gate without OAuth, credentials or network access.

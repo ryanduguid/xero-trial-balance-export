@@ -22,6 +22,8 @@ Column semantics, straight from Xero's report: `Debit`/`Credit` are the **curren
 
 See [`samples/sample-output.csv`](samples/sample-output.csv) for the exact output shape (fabricated entity).
 
+Reproduce the offline movement and YTD gate with the fabricated fixtures in the [Xero trial balance integrity evaluation](evaluation/xero_tb_integrity/README.md).
+
 ## Setup (once, ~5 minutes)
 
 1. Create an app at [developer.xero.com](https://developer.xero.com/app/manage) → New app → Web app. Redirect URI: `http://localhost:8400/callback`. This script intentionally accepts `localhost` only: it runs a local plain-HTTP callback and does not expose an OAuth listener to your LAN.

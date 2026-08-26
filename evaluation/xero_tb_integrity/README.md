@@ -22,7 +22,15 @@ python -B -m unittest tests.test_evaluation_pack -v
 python -B -m unittest discover -s tests -v
 ```
 
-The commands use only the fabricated local fixtures. They make no network request and need no credentials.
+Dependency installation may download the hash-locked packages. Once dependencies are installed, the three evaluation runner commands are fully offline, make no network request and write no output file:
+
+```bash
+python evaluation/xero_tb_integrity/run.py evaluation/xero_tb_integrity/fixtures/passing.csv
+python evaluation/xero_tb_integrity/run.py evaluation/xero_tb_integrity/fixtures/failing_movement.csv
+python evaluation/xero_tb_integrity/run.py evaluation/xero_tb_integrity/fixtures/failing_ytd.csv
+```
+
+They use only the fabricated local fixtures and need no credentials.
 
 ## Expected result
 

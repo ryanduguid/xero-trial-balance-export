@@ -6,6 +6,9 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
+
+from evaluation.xero_tb_integrity import run as evaluation_runner
 
 ROOT = Path(__file__).resolve().parent.parent
 PACK = ROOT / "evaluation" / "xero_tb_integrity"
@@ -14,14 +17,19 @@ EXPECTED = PACK / "expected_results.json"
 
 
 class EvaluationPackTest(unittest.TestCase):
-    def run_path(self, path: str | Path) -> subprocess.CompletedProcess[str]:
+    def run_script(
+        self, runner: Path, path: str | Path
+    ) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
-            [sys.executable, str(RUNNER), str(path)],
+            [sys.executable, str(runner), str(path)],
             cwd=ROOT,
             text=True,
             capture_output=True,
             check=False,
         )
+
+    def run_path(self, path: str | Path) -> subprocess.CompletedProcess[str]:
+        return self.run_script(RUNNER, path)
 
     def run_fixture(self, name: str) -> subprocess.CompletedProcess[str]:
         return self.run_path(PACK / "fixtures" / name)
@@ -85,6 +93,74 @@ class EvaluationPackTest(unittest.TestCase):
                 except OSError as exc:
                     self.skipTest(f"symlinks unavailable: {exc}")
                 self.assert_path_refused(alias)
+
+    def test_symlinked_runner_does_not_reanchor_its_declared_fixtures(self):
+        fixture = PACK / "fixtures" / "passing.csv"
+        with tempfile.TemporaryDirectory() as directory:
+            alias_root = Path(directory)
+            runner_alias = alias_root / "run.py"
+            try:
+                runner_alias.symlink_to(RUNNER)
+            except OSError as exc:
+                self.skipTest(f"runner-file symlinks unavailable: {exc}")
+            fake_fixtures = alias_root / "fixtures"
+            fake_fixtures.mkdir()
+            fake_passing = fake_fixtures / "passing.csv"
+            fake_passing.write_bytes(fixture.read_bytes())
+
+            result = self.run_script(runner_alias, fake_passing)
+
+            self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+            self.assertIn("error:", result.stderr)
+            self.assertIn("declared fabricated", result.stderr)
+
+    @unittest.skipUnless(sys.platform == "win32", "Windows path syntax required")
+    def test_windows_extended_length_declared_paths_are_accepted(self):
+        cases = (
+            ("passing.csv", 0, "PASS: passing.csv"),
+            ("failing_movement.csv", 1, "WARNING: movement"),
+            ("failing_ytd.csv", 1, "WARNING: YTD"),
+        )
+        for name, exit_code, marker in cases:
+            with self.subTest(name=name):
+                declared = (PACK / "fixtures" / name).resolve()
+                extended = "\\\\?\\" + str(declared)
+                result = self.run_path(extended)
+                self.assertEqual(result.returncode, exit_code, result.stdout + result.stderr)
+                self.assertIn(marker, result.stdout)
+
+    @unittest.skipUnless(sys.platform == "win32", "Windows path syntax required")
+    def test_windows_extended_unc_path_is_normalised_before_identity_check(self):
+        fixture_root = r"\\server\share\xero_tb_integrity\fixtures"
+        declared = fixture_root + r"\passing.csv"
+        extended = r"\\?\UNC\server\share\xero_tb_integrity\fixtures\passing.csv"
+        with (
+            mock.patch.object(evaluation_runner, "FIXTURE_ROOT", fixture_root),
+            mock.patch.object(evaluation_runner, "DECLARED_FIXTURES", (declared,)),
+            mock.patch.object(evaluation_runner.os.path, "abspath", side_effect=str),
+            mock.patch.object(evaluation_runner.os.path, "realpath", side_effect=str),
+            mock.patch.object(evaluation_runner.os.path, "isfile", return_value=True),
+        ):
+            try:
+                resolved = evaluation_runner.declared_fixture_path(extended)
+            except ValueError as exc:
+                self.fail(str(exc))
+        self.assertEqual(str(resolved), declared)
+
+    @unittest.skipUnless(sys.platform == "win32", "Windows path syntax required")
+    def test_windows_device_namespace_paths_are_refused(self):
+        declared = str((PACK / "fixtures" / "passing.csv").resolve())
+        for hostile in (
+            "\\\\.\\" + declared,
+            "//./" + declared.replace("\\", "/"),
+            r"\\?\GLOBALROOT\Device\HarddiskVolume1\passing.csv",
+            r"\\?\UNC\.\C$\passing.csv",
+        ):
+            with self.subTest(hostile=hostile):
+                result = self.run_path(hostile)
+                self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+                self.assertIn("error:", result.stderr)
+                self.assertIn("device namespace", result.stderr)
 
     def test_declared_results_are_reproducible(self):
         contract = json.loads(EXPECTED.read_text(encoding="utf-8"))

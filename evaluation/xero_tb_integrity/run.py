@@ -25,7 +25,7 @@ HEADER = [
 ]
 
 FIXTURE_ROOT = os.path.realpath(
-    os.path.abspath(os.path.join(os.path.dirname(__file__), "fixtures"))
+    os.path.abspath(Path(__file__).resolve().parent / "fixtures")
 )
 DECLARED_FIXTURES = tuple(
     os.path.join(FIXTURE_ROOT, name)
@@ -33,9 +33,43 @@ DECLARED_FIXTURES = tuple(
 )
 
 
+def ordinary_windows_path(path: str | Path) -> str:
+    """Remove only recognised Windows extended-length prefixes."""
+    value = os.fspath(path)
+    if os.name != "nt":
+        return value
+    namespace_prefix = (
+        len(value) >= 4
+        and value[0] in "\\/"
+        and value[1] in "\\/"
+        and value[2] in ".?"
+        and value[3] in "\\/"
+    )
+    if namespace_prefix and value[2] == ".":
+        raise ValueError("fixture path must not use a Windows device namespace")
+    extended_prefix = "\\\\?\\"
+    if namespace_prefix and not value.startswith(extended_prefix):
+        raise ValueError("fixture path must not use a Windows device namespace")
+    if not value.startswith(extended_prefix):
+        return value
+    remainder = value[len(extended_prefix) :]
+    if (
+        len(remainder) >= 3
+        and "A" <= remainder[0].upper() <= "Z"
+        and remainder[1:3] == ":\\"
+    ):
+        return remainder
+    if remainder[:4].casefold() == "unc\\":
+        unc_path = remainder[4:]
+        parts = unc_path.split("\\", 2)
+        if len(parts) >= 2 and parts[0] not in ("", ".", "?") and parts[1]:
+            return "\\\\" + unc_path
+    raise ValueError("fixture path must not use a Windows device namespace")
+
+
 def declared_fixture_path(path: str | Path) -> Path:
     """Return a module-owned path for one declared regular fixture."""
-    candidate = os.path.realpath(os.path.abspath(path))
+    candidate = os.path.realpath(os.path.abspath(ordinary_windows_path(path)))
     fixture_root_prefix = os.path.join(FIXTURE_ROOT, "")
     if not candidate.startswith(fixture_root_prefix):
         raise ValueError("fixture path must name a declared fabricated CSV fixture")

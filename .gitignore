@@ -25,10 +25,13 @@ clients/
 *.zip
 *.bak
 
-# Fabricated fixtures only, per the sample-* naming convention
+# Fabricated fixtures only: samples/sample-*.csv and the three named evaluation files
 !samples/
 !samples/sample-*.csv
 !samples/**/sample-*.csv
+!evaluation/xero_tb_integrity/fixtures/passing.csv
+!evaluation/xero_tb_integrity/fixtures/failing_movement.csv
+!evaluation/xero_tb_integrity/fixtures/failing_ytd.csv
 !requirements.txt
 !llms.txt
 

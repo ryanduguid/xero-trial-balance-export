@@ -1,0 +1,39 @@
+{
+  "schema_version": 1,
+  "product_release": "v0.1.4",
+  "fixture_version": "1",
+  "source_reviewed": "2026-08-26",
+  "sources": [
+    {
+      "publisher": "Xero",
+      "title": "Accounting API Reports",
+      "url": "https://developer.xero.com/documentation/api/accounting/reports"
+    },
+    {
+      "publisher": "Xero",
+      "title": "OAuth scopes",
+      "url": "https://developer.xero.com/documentation/guides/oauth2/scopes/"
+    }
+  ],
+  "scenarios": [
+    {
+      "id": "balanced",
+      "fixture": "passing.csv",
+      "exit_code": 0,
+      "output_contains": ["movement and YTD balance"]
+    },
+    {
+      "id": "movement_break",
+      "fixture": "failing_movement.csv",
+      "exit_code": 1,
+      "output_contains": ["WARNING: movement", "Nothing written"]
+    },
+    {
+      "id": "ytd_break",
+      "fixture": "failing_ytd.csv",
+      "exit_code": 1,
+      "output_contains": ["WARNING: YTD", "Nothing written"]
+    }
+  ],
+  "human_decision": "A balanced export passes this integrity control only; a human still decides completeness, classification, accounting treatment and fitness for review."
+}

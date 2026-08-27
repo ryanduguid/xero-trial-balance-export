@@ -38,8 +38,8 @@ TOKEN_URL = "https://identity.xero.com/connect/token"
 CONNECTIONS_URL = "https://api.xero.com/connections"
 from token_store import (  # noqa: E402
     DEFAULT_TOKEN_FILE,
+    allowed_token_roots,
     resolve_token_file,
-    safe_token_path,
 )
 
 TOKEN_FILE = resolve_token_file()
@@ -536,7 +536,18 @@ class TokenSession:
     """Own one token cache's locked read, migration, save and rotation state."""
 
     def __init__(self, token_file: str | None = None) -> None:
-        self._token_file = resolve_token_file(token_file)
+        resolved = resolve_token_file(token_file)
+        for root in allowed_token_roots():
+            if resolved.startswith(root + os.sep):
+                self._allowed_root = root
+                break
+        else:
+            raise SystemExit(
+                "error: token cache path must stay under the home directory, "
+                "the process working directory, the system temp directory, "
+                "or the install directory."
+            )
+        self._token_file = resolved
 
     @property
     def token_file(self) -> str:
@@ -546,7 +557,13 @@ class TokenSession:
     @contextmanager
     def _locked(self):
         """Hold the cross-process lock for this cache transaction."""
-        token_file = safe_token_path(self._token_file)
+        token_file = os.path.realpath(
+            os.path.abspath(os.path.expanduser(self._token_file))
+        )
+        if os.path.basename(token_file) != "token.json":
+            raise SystemExit("error: token cache path must be named token.json")
+        if not token_file.startswith(self._allowed_root + os.sep):
+            raise SystemExit("error: token cache path escaped its allowed directory")
         lock_path = token_file + ".lock"
         try:
             os.makedirs(os.path.dirname(token_file) or ".", exist_ok=True)
@@ -583,7 +600,13 @@ class TokenSession:
 
     def _persist_unlocked(self, data: dict, *, legacy_migration: bool) -> None:
         """Write a complete cache document through the atomic replacement path."""
-        token_file = safe_token_path(self._token_file)
+        token_file = os.path.realpath(
+            os.path.abspath(os.path.expanduser(self._token_file))
+        )
+        if os.path.basename(token_file) != "token.json":
+            raise SystemExit("error: token cache path must be named token.json")
+        if not token_file.startswith(self._allowed_root + os.sep):
+            raise SystemExit("error: token cache path escaped its allowed directory")
         encoded = _encode_token_cache(data)
         fd, tmp_path = tempfile.mkstemp(dir=os.path.dirname(token_file), suffix=".tmp")
         try:
@@ -662,7 +685,13 @@ class TokenSession:
             self._save_unlocked(token_response)
 
     def _load_unlocked(self) -> dict:
-        token_file = safe_token_path(self._token_file)
+        token_file = os.path.realpath(
+            os.path.abspath(os.path.expanduser(self._token_file))
+        )
+        if os.path.basename(token_file) != "token.json":
+            raise SystemExit("error: token cache path must be named token.json")
+        if not token_file.startswith(self._allowed_root + os.sep):
+            raise SystemExit("error: token cache path escaped its allowed directory")
         if not os.path.exists(token_file):
             raise SystemExit("No token.json - run: python auth.py")
         try:

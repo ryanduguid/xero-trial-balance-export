@@ -624,7 +624,7 @@ class TokenSessionContractTest(unittest.TestCase):
         )
         for candidate, expected in (
             (refused_path, "must be named token.json"),
-            (outside_path, "must stay under"),
+            (outside_path, "escaped its allowed directory"),
         ):
             with self.subTest(candidate=candidate):
                 self.session._token_file = candidate

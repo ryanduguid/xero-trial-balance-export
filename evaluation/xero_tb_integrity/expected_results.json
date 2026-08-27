@@ -1,8 +1,22 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
+  "corpus_id": "xero-tb-csv.v1",
+  "owner_repository": "https://github.com/ryanduguid/xero-trial-balance-export",
   "product_release": "v0.1.4",
   "fixture_version": "1",
   "source_reviewed": "2026-08-26",
+  "canonical_columns": [
+    "ReportDate",
+    "Tenant",
+    "Section",
+    "AccountID",
+    "AccountName",
+    "AccountCode",
+    "Debit",
+    "Credit",
+    "YTDDebit",
+    "YTDCredit"
+  ],
   "sources": [
     {
       "publisher": "Xero",
@@ -19,20 +33,34 @@
     {
       "id": "balanced",
       "fixture": "passing.csv",
+      "sha256": "e5ca283bf0f2f19c8a6eaa8c20b7fbb5b352aac5011c86c2828c1dffd4917ccc",
       "exit_code": 0,
-      "output_contains": ["movement and YTD balance"]
+      "output_contains": ["movement and YTD balance"],
+      "conformance": {
+        "accept": true
+      }
     },
     {
       "id": "movement_break",
       "fixture": "failing_movement.csv",
+      "sha256": "fcca023e653bc1503d853042da9c263925ffe4bff9791e26487c9e14e323a644",
       "exit_code": 1,
-      "output_contains": ["WARNING: movement", "Nothing written"]
+      "output_contains": ["WARNING: movement", "Nothing written"],
+      "conformance": {
+        "accept": false,
+        "error_contains": "movement debit and credit totals"
+      }
     },
     {
       "id": "ytd_break",
       "fixture": "failing_ytd.csv",
+      "sha256": "9461f65cebdab9dae79e4cc2063314ee477d0ef8dc96b62df84e78e03c7fca7e",
       "exit_code": 1,
-      "output_contains": ["WARNING: YTD", "Nothing written"]
+      "output_contains": ["WARNING: YTD", "Nothing written"],
+      "conformance": {
+        "accept": false,
+        "error_contains": "YTD debit and credit totals"
+      }
     }
   ],
   "human_decision": "A balanced export passes this integrity control only; a human still decides completeness, classification, accounting treatment and fitness for review."

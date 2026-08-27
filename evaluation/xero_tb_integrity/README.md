@@ -36,6 +36,10 @@ They use only the fabricated local fixtures and need no credentials.
 
 [`expected_results.json`](expected_results.json) is the machine-readable contract. `passing.csv` exits 0 and reports that movement and YTD balance. Each failing fixture exits 1, identifies its failed pair and reports that nothing was written.
 
+## Shared conformance corpus
+
+This repository owns the data-only `xero-tb-csv.v1` conformance corpus. The contract records the canonical ten-column order, every fabricated fixture's SHA-256 digest, and whether a conforming consumer must accept or reject it. Downstream repositories can vendor these four files at a named commit and verify them without a runtime network dependency.
+
 ## Controls triggered
 
 `failing_movement.csv` breaks only the current-month Debit/Credit pair. `failing_ytd.csv` breaks only the YTDDebit/YTDCredit pair. The runner calls the production `check_balanced` gate for each fixture, before any CSV write.

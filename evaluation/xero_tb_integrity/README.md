@@ -38,7 +38,7 @@ They use only the fabricated local fixtures and need no credentials.
 
 ## Shared conformance corpus
 
-This repository owns the data-only `xero-tb-csv.v1` conformance corpus. The contract records the canonical ten-column order, every fabricated fixture's SHA-256 digest, and whether a conforming consumer must accept or reject it. Downstream repositories can vendor these four files at a named commit and verify them without a runtime network dependency.
+This repository owns the data-only `xero-tb-csv.v1` conformance corpus. The contract records the canonical ten-column order, every fabricated fixture's SHA-256 digest, and whether a conforming consumer must accept or reject it. The corpus files use LF line endings so those byte-level pins are identical on every supported platform. Downstream repositories can vendor these four files at a named commit and verify them without a runtime network dependency.
 
 ## Controls triggered
 

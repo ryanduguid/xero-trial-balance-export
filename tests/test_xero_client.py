@@ -510,7 +510,7 @@ class SaveTokensTest(unittest.TestCase):
         with open(self.token_file) as fh:
             self.assertEqual(json.load(fh)["refresh_token"], "OLD-CONSUMED")
         self.assertTrue(message.startswith("error: "), message)
-        self.assertIn(tmp_path, message)
+        self.assertIn(os.path.realpath(tmp_path), message)
         self.assertNotIn("NEW", message)
 
     def test_an_fsync_failure_keeps_the_new_token_on_disk(self):
@@ -537,7 +537,7 @@ class SaveTokensTest(unittest.TestCase):
         with open(self.token_file) as fh:
             self.assertEqual(json.load(fh)["refresh_token"], "OLD-CONSUMED")
         self.assertTrue(message.startswith("error: "), message)
-        self.assertIn(tmp_path, message)
+        self.assertIn(os.path.realpath(tmp_path), message)
         self.assertIn("python auth.py", message)
         self.assertNotIn("NEW", message)
 

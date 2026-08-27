@@ -1,5 +1,7 @@
 # Releasing
 
+The repository's [GitHub Releases](https://github.com/ryanduguid/xero-trial-balance-export/releases) page is the canonical release history. A separate changelog is intentionally not maintained.
+
 Releases are built by GitHub Actions from an annotated tag on the exact `main` commit. Do not create or upload release assets by hand.
 
 ## Protected v0.1.2 failed tag
@@ -7,6 +9,21 @@ Releases are built by GitHub Actions from an annotated tag on the exact `main` c
 The annotated `v0.1.2` tag is protected and permanently records commit `bd4cd417b06fb9dba3d6b36fbedbe544b1e0fec7`. [Release workflow run 31832080223](https://github.com/ryanduguid/xero-trial-balance-export/actions/runs/31832080223) completed the tests, deterministic archives, checksums and both attestation steps, then failed safely at the immediate remote recheck because that GitHub CLI step did not receive `GH_TOKEN`. The publication step was skipped, and the authenticated release inventory confirmed that no v0.1.2 release or draft exists.
 
 Do not move, delete or reuse `v0.1.2`. The no-bypass tag ruleset prevents those operations; `v0.1.3` is the recovery version.
+
+## Preserved squash-boundary releases
+
+Two published tags point at pull-request-side commits that preceded their
+squash merges to `main`. They are intentional historical exceptions outside
+current `main` ancestry:
+
+| Release | Tag object | Peeled commit |
+| --- | --- | --- |
+| `v0.1.1` | `aeee63b723fcf5276f9375769668c865b19ba8bb` | `d9b4cfd9ee8398c30dbe64b4ba2254aca900c006` |
+| `v0.1.3` | `e52022b2e81c1920619d66e77b388b44876c8337` | `8586a960b4fd08dd0cd68be28fcac811a20a2e0c` |
+
+Preserve those immutable tags exactly as published. Do not move, delete or
+recreate them to make the history appear linear. Every future release tag must
+point to a commit reachable from protected `main`.
 
 Before tagging:
 

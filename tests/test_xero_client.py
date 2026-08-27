@@ -612,6 +612,34 @@ class TokenSessionContractTest(unittest.TestCase):
             with self.subTest(retired=retired):
                 self.assertFalse(hasattr(xero_client, retired))
 
+    def test_session_revalidates_its_stored_path_before_file_use(self):
+        refused_dir = os.path.join(self.temp_dir.name, "refused")
+        refused_path = os.path.join(refused_dir, "cache.json")
+
+        with self.assertRaises(AttributeError):
+            self.session.token_file = refused_path
+
+        outside_path = os.path.join(
+            os.path.abspath(os.sep), *([os.pardir] * 12), "token.json"
+        )
+        for candidate, expected in (
+            (refused_path, "must be named token.json"),
+            (outside_path, "must stay under"),
+        ):
+            with self.subTest(candidate=candidate):
+                self.session._token_file = candidate
+                with self.assertRaises(SystemExit) as ctx:
+                    self.session.save(
+                        {
+                            "access_token": "SESSION-A",
+                            "refresh_token": "SESSION-R",
+                            "expires_in": 1800,
+                        }
+                    )
+                self.assertIn(expected, str(ctx.exception))
+
+        self.assertFalse(os.path.exists(refused_dir))
+
 
 class TokenCacheProtectionTest(unittest.TestCase):
     def setUp(self):

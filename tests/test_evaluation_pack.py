@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import csv
+import hashlib
 import json
 import subprocess
 import sys
@@ -171,6 +173,64 @@ class EvaluationPackTest(unittest.TestCase):
                 combined = result.stdout + result.stderr
                 for marker in scenario["output_contains"]:
                     self.assertIn(marker, combined)
+
+    def test_pack_is_a_pinned_cross_repository_conformance_corpus(self):
+        contract = json.loads(EXPECTED.read_text(encoding="utf-8"))
+        canonical_columns = [
+            "ReportDate",
+            "Tenant",
+            "Section",
+            "AccountID",
+            "AccountName",
+            "AccountCode",
+            "Debit",
+            "Credit",
+            "YTDDebit",
+            "YTDCredit",
+        ]
+        expected = {
+            "balanced": (
+                "passing.csv",
+                "2cbe9997a8e7210936ff3c59b5d3fdb0041c1b375b0f9c88cf9ee30d0f356a09",
+                {"accept": True},
+            ),
+            "movement_break": (
+                "failing_movement.csv",
+                "702175df967b2854e7897cd27fdc4aca441e21b52438381108fabe88ff3153e4",
+                {
+                    "accept": False,
+                    "error_contains": "movement debit and credit totals",
+                },
+            ),
+            "ytd_break": (
+                "failing_ytd.csv",
+                "ec757f12d13866360fbab189228ebb425893c6f8b299809c6f8567bf5817c64b",
+                {
+                    "accept": False,
+                    "error_contains": "YTD debit and credit totals",
+                },
+            ),
+        }
+
+        self.assertEqual(contract["schema_version"], 2)
+        self.assertEqual(contract["corpus_id"], "xero-tb-csv.v1")
+        self.assertEqual(
+            contract["owner_repository"],
+            "https://github.com/ryanduguid/xero-trial-balance-export",
+        )
+        self.assertEqual(contract["canonical_columns"], canonical_columns)
+        scenarios = {scenario["id"]: scenario for scenario in contract["scenarios"]}
+        self.assertEqual(set(scenarios), set(expected))
+        for scenario_id, (name, digest, conformance) in expected.items():
+            with self.subTest(scenario=scenario_id):
+                scenario = scenarios[scenario_id]
+                fixture = PACK / "fixtures" / name
+                self.assertEqual(scenario["fixture"], name)
+                self.assertEqual(scenario["sha256"], digest)
+                self.assertEqual(scenario["conformance"], conformance)
+                self.assertEqual(hashlib.sha256(fixture.read_bytes()).hexdigest(), digest)
+                with fixture.open(encoding="utf-8-sig", newline="") as source:
+                    self.assertEqual(next(csv.reader(source)), canonical_columns)
 
     def test_passing_fixture_proves_both_pairs(self):
         result = self.run_fixture("passing.csv")

@@ -4,7 +4,7 @@ This exporter reads a Xero trial balance and writes a validated CSV. It stays re
 
 ## Data boundary
 
-- Never commit credentials. The `.gitignore` blocks `.env*` except `.env.example`, plus `token.json`, its credential-free lock file, and the common export extensions. Keep `.env.example` to placeholder values.
+- Never commit credentials. The `.gitignore` blocks `.env*` except `.env.example`, plus `token.json`, its credential-free lock file, `*.json`, and the common export extensions. Keep `.env.example` to placeholder values.
 - Keep exported trial balances, account lists and tenant identifiers from a real organisation out of the repository. Sample data belongs in `samples/`.
 - On Windows, token-cache changes must preserve current-user DPAPI protection, the versioned envelope, UI-forbidden operation and atomic plaintext migration before any network call. Do not add a repository key or custom cryptography. On non-Windows systems the documented compatibility fallback stays plaintext and must remain mode `0600` where POSIX permissions are supported.
 

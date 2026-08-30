@@ -3,7 +3,7 @@
 !.env.example
 token.json
 token.json.lock
-token.json
+*.json
 *.tmp
 *.log
 

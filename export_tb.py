@@ -546,7 +546,17 @@ def write_csv(out_rows: list[dict], out_path: str) -> None:
         os.makedirs(out_dir, exist_ok=True)
     except OSError as exc:
         sys.exit(f"error: cannot create the output directory {out_dir} ({exc}).")
-    fd, tmp_path = tempfile.mkstemp(dir=out_dir, suffix=".csv.tmp")
+    # makedirs(exist_ok=True) is satisfied by a directory that already exists
+    # and is not writable, so mkstemp still has to be guarded: a read-only
+    # output directory raised a bare PermissionError traceback here, after the
+    # report had been fetched and this run's single-use refresh token spent.
+    try:
+        fd, tmp_path = tempfile.mkstemp(dir=out_dir, suffix=".csv.tmp")
+    except OSError as exc:
+        sys.exit(
+            f"error: cannot write a temporary file in {out_dir} ({exc}); "
+            "the report was fetched but nothing was written."
+        )
 
     def write_rows(fh) -> None:
         writer = csv.DictWriter(fh, fieldnames=fieldnames)

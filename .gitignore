@@ -3,7 +3,7 @@
 !.env.example
 token.json
 token.json.lock
-token.json
+*.json
 *.tmp
 *.log
 
@@ -32,6 +32,7 @@ clients/
 !evaluation/xero_tb_integrity/fixtures/passing.csv
 !evaluation/xero_tb_integrity/fixtures/failing_movement.csv
 !evaluation/xero_tb_integrity/fixtures/failing_ytd.csv
+!evaluation/xero_tb_integrity/expected_results.json
 !requirements.txt
 !llms.txt
 

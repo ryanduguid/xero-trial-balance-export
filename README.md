@@ -64,7 +64,17 @@ Two Xero platform limits worth knowing: uncertified apps connect to at most 25 o
 
 ## Scheduled runs
 
-Point the job at a stable token cache first. Resolution order is `--token-file`, then `XERO_TOKEN_FILE`, then an existing module-adjacent `token.json`, then the per-user state directory. Pin the path in a scheduled job so a checkout move cannot orphan the cache and an operator's flag always wins. The lock file (`<cache>.lock`) always sits beside whichever cache path wins. Run the job as the same user that ran `auth.py` (on Windows this is mandatory: the DPAPI cache only decrypts under that user's profile).
+Point the job at a stable token cache first. `export_tb.py` resolves it in the order `--token-file`, then `XERO_TOKEN_FILE`, then an existing module-adjacent `token.json`, then the per-user state directory. Pin the path in a scheduled job so a checkout move cannot orphan the cache and an operator's flag always wins. The lock file (`<cache>.lock`) always sits beside whichever cache path wins. Run the job as the same user that ran `auth.py` (on Windows this is mandatory: the DPAPI cache only decrypts under that user's profile).
+
+Authorise into that same path. `auth.py` has **no `--token-file` flag**: it takes the cache path only from `XERO_TOKEN_FILE`, read from the environment or from `.env`. Set it before running `auth.py`, or the pinned path in the recipes below names a cache `auth.py` never wrote and the first scheduled run fails with no `token.json`. Put `XERO_TOKEN_FILE=/srv/xero/token.json` in `.env` (see `.env.example`) so both commands agree, or set it for the one authorisation run:
+
+```bash
+XERO_TOKEN_FILE=/srv/xero/token.json python auth.py    # Linux or macOS
+```
+
+```powershell
+$env:XERO_TOKEN_FILE = "C:\xero\token.json"; python auth.py    # Windows PowerShell
+```
 
 Exit codes: `0` means the export succeeded and the CSV is in place. `1` means the run failed and printed a one-line reason (most failures report on stderr; the balance-check warnings print on stdout, so capture both streams). `2` means a command-line error (a malformed `--date`, an `--out` outside the working directory). Any non-zero exit writes no CSV to the destination, though a locked destination leaves the finished export beside it as a named `*.csv.tmp`.
 

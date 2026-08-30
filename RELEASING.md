@@ -1,5 +1,7 @@
 # Releasing
 
+The repository's [GitHub Releases](https://github.com/ryanduguid/xero-trial-balance-export/releases) page is the canonical release history. A separate changelog is intentionally not maintained.
+
 Releases are built by GitHub Actions from an annotated tag on the exact `main` commit. Do not create or upload release assets by hand.
 
 ## Protected v0.1.2 failed tag
@@ -7,6 +9,21 @@ Releases are built by GitHub Actions from an annotated tag on the exact `main` c
 The annotated `v0.1.2` tag is protected and permanently records commit `bd4cd417b06fb9dba3d6b36fbedbe544b1e0fec7`. [Release workflow run 31832080223](https://github.com/ryanduguid/xero-trial-balance-export/actions/runs/31832080223) completed the tests, deterministic archives, checksums and both attestation steps, then failed safely at the immediate remote recheck because that GitHub CLI step did not receive `GH_TOKEN`. The publication step was skipped, and the authenticated release inventory confirmed that no v0.1.2 release or draft exists.
 
 Do not move, delete or reuse `v0.1.2`. The no-bypass tag ruleset prevents those operations; `v0.1.3` is the recovery version.
+
+## Preserved squash-boundary releases
+
+Two published tags point at pull-request-side commits that preceded their
+squash merges to `main`. They are intentional historical exceptions outside
+current `main` ancestry:
+
+| Release | Tag object | Peeled commit |
+| --- | --- | --- |
+| `v0.1.1` | `aeee63b723fcf5276f9375769668c865b19ba8bb` | `d9b4cfd9ee8398c30dbe64b4ba2254aca900c006` |
+| `v0.1.3` | `e52022b2e81c1920619d66e77b388b44876c8337` | `8586a960b4fd08dd0cd68be28fcac811a20a2e0c` |
+
+Preserve those immutable tags exactly as published. Do not move, delete or
+recreate them to make the history appear linear. Every future release tag must
+point to a commit reachable from protected `main`.
 
 Before tagging:
 
@@ -61,6 +78,32 @@ gh release view "$tag" -R "$repo" --json isImmutable,isLatest,tagName \
   | jq -e --arg tag "$tag" \
       '.isImmutable == true and .isLatest == true and .tagName == $tag'
 gh release verify "$tag" -R "$repo"
+```
+
+The block above preserves the reusable signer identity of historical release
+`v0.1.3`. Releases cut after the archive-policy migration are signed by the
+policy's internal publication workflow. For the next release, update `tag` if
+the intended version changes and bind verification to the exact source and
+policy commit:
+
+```bash
+tag=v0.1.5
+repo=ryanduguid/xero-trial-balance-export
+release_commit="$(git ls-remote "https://github.com/$repo.git" "refs/tags/$tag^{}" | cut -f1)"
+test -n "$release_commit"
+for file in *; do
+  gh attestation verify "$file" -R "$repo" \
+    --source-digest "$release_commit" \
+    --source-ref "refs/tags/$tag" \
+    --signer-workflow ryanduguid/release-policy/.github/workflows/publish-archives.yml \
+    --signer-digest 8b4de1ed339f1358b5f3e850b63412d8717d01da
+done
+gh attestation verify "xero-trial-balance-export-${tag#v}.zip" -R "$repo" \
+  --predicate-type https://spdx.dev/Document/v2.3 \
+  --source-digest "$release_commit" \
+  --source-ref "refs/tags/$tag" \
+  --signer-workflow ryanduguid/release-policy/.github/workflows/publish-archives.yml \
+  --signer-digest 8b4de1ed339f1358b5f3e850b63412d8717d01da
 ```
 
 If any gate fails, inspect it before touching the draft. Never move, delete or reuse a protected release tag, whether or not publication completed.

@@ -32,7 +32,7 @@ export-tb = "export_tb:run"
 xero-tb-auth = "auth:main"
 
 [tool.setuptools]
-py-modules = ["auth", "xero_client", "export_tb"]
+py-modules = ["auth", "xero_client", "export_tb", "token_store"]
 
 [tool.setuptools.dynamic]
 version = { file = "VERSION" }

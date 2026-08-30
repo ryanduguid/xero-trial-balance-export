@@ -5,7 +5,7 @@
 - **Repository**: https://github.com/ryanduguid/xero-trial-balance-export
 - **CLI Commands**: `export-tb`, `xero-tb-auth`
 - **Domain**: Read-only CLI and Python utility for exporting Xero trial balances via OAuth 2.0 into structured, validated CSV files for Power BI, Excel, and pandas.
-- **Standards**: Xero API OAuth 2.0 Authorization Code Flow with PKCE, double-entry trial balance movement gates.
+- **Standards**: Xero API OAuth 2.0 authorization-code flow (confidential client with client secret; no PKCE), double-entry trial balance movement gates.
 
 ## Core Modules & APIs
 - `auth`: Automated OAuth 2.0 authentication harness with token refresh lifecycle preservation.

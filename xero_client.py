@@ -48,10 +48,20 @@ TOKEN_FILE = resolve_token_file()
 def load_dotenv(path: str | Path | None = None) -> None:
     """Load KEY=VALUE lines from .env without overriding the process env."""
     env_path = Path(path) if path is not None else Path(".env")
+    # utf-8-sig, not utf-8: Notepad and PowerShell's Set-Content write a UTF-8
+    # BOM, and reading it as plain utf-8 glues U+FEFF onto the first key, so
+    # XERO_CLIENT_ID is set under a name nothing reads and the run dies telling
+    # the operator to set a variable they already set. A file that is not UTF-8
+    # at all (Notepad's "Unicode" is UTF-16) raised UnicodeDecodeError straight
+    # through the OSError arm as a traceback.
     try:
-        text = env_path.read_text(encoding="utf-8")
+        text = env_path.read_text(encoding="utf-8-sig")
     except OSError:
         return
+    except UnicodeDecodeError:
+        raise SystemExit(
+            f"error: {env_path} is not valid UTF-8; save it as UTF-8 and re-run."
+        ) from None
     for raw in text.splitlines():
         line = raw.strip()
         if not line or line.startswith("#") or "=" not in line:

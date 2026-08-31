@@ -1,6 +1,8 @@
 import argparse
+import ast
 import io
 import os
+import re
 import sys
 import tempfile
 import unicodedata
@@ -707,6 +709,65 @@ class NestedOutputDirectoryTest(_ExportCase):
         self.assertIsNotNone(data, "the export did not reach the nested path")
         self.assertIn(b"Cash", data)
         self.assertEqual(os.listdir(os.path.join(self.work_dir, "exports")), ["tb.csv"])
+
+
+class UnwritableOutputDirectoryTest(_ExportCase):
+    """makedirs(exist_ok=True) is satisfied by a directory that already exists
+    and refuses writes, so the mkstemp beneath it needs its own guard: a
+    read-only destination - a Power BI data folder an administrator locked
+    down - ended the run in a bare PermissionError traceback, after the report
+    had been fetched and this run's single-use refresh token spent."""
+
+    BALANCED = [
+        ("Cash (090)", "100.00", "", "100.00", ""),
+        ("Equity (960)", "", "100.00", "", "100.00"),
+    ]
+
+    ROWS = [
+        {
+            "ReportDate": "2026-06-30", "Tenant": "Catherby Fisheries Pty Ltd",
+            "Section": "Assets", "AccountID": "account-guid",
+            "AccountName": "Cash", "AccountCode": "090",
+            "Debit": "100.0", "Credit": "0.0",
+            "YTDDebit": "100.0", "YTDCredit": "0.0",
+        },
+    ]
+
+    def assert_one_line_refusal(self, message):
+        self.assertTrue(message.startswith("error: "), message)
+        self.assertEqual(len(message.splitlines()), 1, message)
+        self.assertIn("cannot write a temporary file", message)
+        self.assertIn("nothing was written", message)
+
+    def test_a_refused_temp_file_is_reported_instead_of_raising(self):
+        with mock.patch.object(
+            export_tb.tempfile, "mkstemp", side_effect=PermissionError(13, "denied")
+        ) as mkstemp:
+            raised, _, data = self.run_export(self.BALANCED)
+
+        mkstemp.assert_called_once()
+        self.assertIsInstance(raised, SystemExit)
+        self.assert_one_line_refusal(str(raised.code))
+        self.assertIsNone(data, "nothing should reach --out")
+
+    @unittest.skipIf(sys.platform == "win32", "POSIX directory permissions required")
+    @unittest.skipIf(
+        getattr(os, "geteuid", lambda: 1)() == 0,
+        "root writes into a read-only directory anyway",
+    )
+    def test_a_read_only_directory_on_disk_is_reported_the_same_way(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            out_dir = os.path.join(temp_dir, "locked")
+            os.mkdir(out_dir)
+            os.chmod(out_dir, 0o555)
+            try:
+                with self.assertRaises(SystemExit) as ctx:
+                    export_tb.write_csv(self.ROWS, os.path.join(out_dir, "tb.csv"))
+                self.assertEqual(os.listdir(out_dir), [])
+            finally:
+                os.chmod(out_dir, 0o755)
+
+        self.assert_one_line_refusal(str(ctx.exception.code))
 
 
 class OutputReplaceLockTest(_ExportCase):
@@ -1446,6 +1507,52 @@ class TransportFailureTest(unittest.TestCase):
         )
         self.assertRegex(text, r'(?m)^export-tb = "export_tb:run"$')
         self.assertNotRegex(text, r'(?m)^export-tb = "export_tb:main"$')
+
+    def test_every_module_the_console_scripts_import_is_packaged(self):
+        """py-modules listed only what the scripts import directly.
+
+        token_store is reached through xero_client, so it was left out of
+        every wheel and sdist and both console scripts died with
+        ModuleNotFoundError on first import - a failure no test in this
+        suite could see, because a source checkout imports it fine.
+        """
+        root = Path(__file__).resolve().parents[1]
+        text = (root / "pyproject.toml").read_text(encoding="utf-8")
+
+        modules_match = re.search(r"(?m)^py-modules = (\[[^]]*\])", text)
+        self.assertIsNotNone(modules_match, "pyproject.toml has no py-modules list")
+        packaged = set(ast.literal_eval(modules_match.group(1)))
+        self.assertIn("token_store", packaged)
+
+        scripts = text.split("[project.scripts]", 1)[1].split("\n[", 1)[0]
+        entry_points = set(re.findall(r'=\s*"([^":]+):', scripts))
+        self.assertTrue(entry_points, "pyproject.toml declares no console scripts")
+
+        # Walk the local import graph, not just the direct imports: a module
+        # the scripts only reach through another module still ships or the
+        # entry point cannot be imported.
+        reached: set[str] = set()
+        queue = list(entry_points)
+        while queue:
+            name = queue.pop()
+            if name in reached:
+                continue
+            reached.add(name)
+            tree = ast.parse((root / f"{name}.py").read_text(encoding="utf-8"))
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Import):
+                    imported = [alias.name.split(".")[0] for alias in node.names]
+                elif isinstance(node, ast.ImportFrom) and node.level == 0:
+                    imported = [(node.module or "").split(".")[0]]
+                else:
+                    continue
+                queue += [n for n in imported if (root / f"{n}.py").is_file()]
+
+        self.assertEqual(
+            reached - packaged,
+            set(),
+            "modules the console scripts import are missing from py-modules",
+        )
 
     def test_token_file_help_says_the_flag_beats_the_environment(self):
         with mock.patch.object(sys, "argv", ["export_tb.py", "--help"]):

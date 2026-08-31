@@ -1,0 +1,2 @@
+evaluation/xero_tb_integrity/expected_results.json text eol=lf
+evaluation/xero_tb_integrity/fixtures/*.csv text eol=lf

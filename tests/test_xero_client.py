@@ -1183,5 +1183,54 @@ class TokenCacheLockGuardTest(unittest.TestCase):
             self.assertTrue(os.path.exists(cache_path + ".lock"))
 
 
+class LoadDotenvEncodingTest(unittest.TestCase):
+    """The .env a Windows operator actually produces.
+
+    Notepad's "UTF-8" writes a BOM and its "Unicode" writes UTF-16, and
+    load_dotenv() is the single reader for both auth.py and export_tb.py.
+    """
+
+    BODY = "XERO_CLIENT_ID=abc123\nXERO_CLIENT_SECRET=shh\n"
+
+    def _load(self, raw: bytes) -> dict:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            env_path = os.path.join(temp_dir, ".env")
+            with open(env_path, "wb") as fh:
+                fh.write(raw)
+            with mock.patch.dict(os.environ, {}, clear=True):
+                xero_client.load_dotenv(env_path)
+                return dict(os.environ)
+
+    def test_a_plain_utf8_env_is_unaffected(self):
+        loaded = self._load(self.BODY.encode("utf-8"))
+        self.assertEqual(loaded.get("XERO_CLIENT_ID"), "abc123")
+        self.assertEqual(loaded.get("XERO_CLIENT_SECRET"), "shh")
+
+    def test_a_utf8_bom_does_not_glue_itself_onto_the_first_key(self):
+        """Read as plain utf-8 the BOM became part of the first key's name, so
+        XERO_CLIENT_ID stayed unset and the run told the operator to set the
+        variable they had just set - a dead end with nothing to read."""
+        loaded = self._load(self.BODY.encode("utf-8-sig"))
+        self.assertEqual(loaded.get("XERO_CLIENT_ID"), "abc123")
+        self.assertEqual(loaded.get("XERO_CLIENT_SECRET"), "shh")
+        self.assertEqual([key for key in loaded if "\ufeff" in key], [])
+
+    def test_a_utf16_env_exits_with_one_line_and_not_a_traceback(self):
+        """UnicodeDecodeError is a ValueError, so it went straight past the
+        OSError arm and out of main() as a traceback."""
+        with self.assertRaises(SystemExit) as ctx:
+            self._load(self.BODY.encode("utf-16"))
+        message = str(ctx.exception.code)
+        self.assertTrue(message.startswith("error: "), message)
+        self.assertIn(".env", message)
+        self.assertIn("not valid UTF-8", message)
+
+    def test_a_missing_env_is_still_silent(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with mock.patch.dict(os.environ, {}, clear=True):
+                xero_client.load_dotenv(os.path.join(temp_dir, ".env"))
+                self.assertNotIn("XERO_CLIENT_ID", os.environ)
+
+
 if __name__ == "__main__":
     unittest.main()

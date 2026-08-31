@@ -13,7 +13,7 @@ class ReleasePolicyTests(unittest.TestCase):
         )
         self.assertIn(
             "ryanduguid/release-policy/.github/workflows/release-archive.yml@"
-            "47480b782926179b621ec1c6643ef88c80fc8fd4",
+            "8b4de1ed339f1358b5f3e850b63412d8717d01da",
             workflow,
         )
         self.assertIn("artifact-stem: xero-trial-balance-export", workflow)

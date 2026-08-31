@@ -1,3 +1,4 @@
+import inspect
 import json
 import multiprocessing
 import os
@@ -365,6 +366,7 @@ class SaveTokensTest(unittest.TestCase):
         patcher = mock.patch.object(xero_client, "TOKEN_FILE", self.token_file)
         patcher.start()
         self.addCleanup(patcher.stop)
+        self.session = xero_client.TokenSession(self.token_file)
 
     def _temp_files(self):
         return sorted(f for f in os.listdir(self.dir) if f.endswith(".tmp"))
@@ -380,7 +382,7 @@ class SaveTokensTest(unittest.TestCase):
             "expires_in": 1800,
             "obtained_at": 0.0,
         }
-        xero_client._persist_token_cache_unlocked(cached, legacy_migration=False)
+        self.session._persist_unlocked(cached, legacy_migration=False)
         with open(self.token_file, "rb") as source:
             return source.read()
 
@@ -508,7 +510,7 @@ class SaveTokensTest(unittest.TestCase):
         with open(self.token_file) as fh:
             self.assertEqual(json.load(fh)["refresh_token"], "OLD-CONSUMED")
         self.assertTrue(message.startswith("error: "), message)
-        self.assertIn(tmp_path, message)
+        self.assertIn(os.path.realpath(tmp_path), message)
         self.assertNotIn("NEW", message)
 
     def test_an_fsync_failure_keeps_the_new_token_on_disk(self):
@@ -535,7 +537,7 @@ class SaveTokensTest(unittest.TestCase):
         with open(self.token_file) as fh:
             self.assertEqual(json.load(fh)["refresh_token"], "OLD-CONSUMED")
         self.assertTrue(message.startswith("error: "), message)
-        self.assertIn(tmp_path, message)
+        self.assertIn(os.path.realpath(tmp_path), message)
         self.assertIn("python auth.py", message)
         self.assertNotIn("NEW", message)
 
@@ -548,6 +550,97 @@ class SaveTokensTest(unittest.TestCase):
         self.assertEqual(self._temp_files(), [])
 
 
+class TokenSessionContractTest(unittest.TestCase):
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp_dir.cleanup)
+        self.token_file = os.path.join(self.temp_dir.name, "token.json")
+        self.session = xero_client.TokenSession(self.token_file)
+
+    def test_session_owns_one_path_without_mutating_the_module_default(self):
+        original = xero_client.TOKEN_FILE
+
+        with mock.patch.object(xero_client.time, "time", return_value=1_000.0):
+            self.session.save(
+                {
+                    "access_token": "SESSION-A",
+                    "refresh_token": "SESSION-R",
+                    "expires_in": 1800,
+                }
+            )
+
+        self.assertEqual(self.session.load()["access_token"], "SESSION-A")
+        self.assertEqual(xero_client.TOKEN_FILE, original)
+        self.assertTrue(os.path.exists(self.token_file + ".lock"))
+
+    def test_rotation_is_atomic_behind_a_fake_endpoint_callback(self):
+        with mock.patch.object(xero_client.time, "time", return_value=1_000.0):
+            self.session.save(
+                {
+                    "access_token": "OLD-A",
+                    "refresh_token": "OLD-R",
+                    "expires_in": 1800,
+                }
+            )
+        seen = []
+
+        def fake_endpoint(refresh_token):
+            seen.append(refresh_token)
+            return {
+                "access_token": "NEW-A",
+                "refresh_token": "NEW-R",
+                "expires_in": 1800,
+            }
+
+        with mock.patch.object(xero_client.time, "time", return_value=2_000.0):
+            access_token = self.session.access_token(fake_endpoint, force=True)
+
+        self.assertEqual(access_token, "NEW-A")
+        self.assertEqual(seen, ["OLD-R"])
+        self.assertEqual(self.session.load()["refresh_token"], "NEW-R")
+
+    def test_session_has_no_endpoint_knowledge_and_replaces_global_cache_helpers(self):
+        source = inspect.getsource(xero_client.TokenSession)
+        self.assertNotIn("requests.", source)
+        self.assertNotIn("TOKEN_URL", source)
+        for retired in (
+            "_token_cache_lock",
+            "_save_tokens_unlocked",
+            "_persist_token_cache_unlocked",
+            "_load_tokens_unlocked",
+        ):
+            with self.subTest(retired=retired):
+                self.assertFalse(hasattr(xero_client, retired))
+
+    def test_session_revalidates_its_stored_path_before_file_use(self):
+        refused_dir = os.path.join(self.temp_dir.name, "refused")
+        refused_path = os.path.join(refused_dir, "cache.json")
+
+        with self.assertRaises(AttributeError):
+            self.session.token_file = refused_path
+
+        outside_path = os.path.join(
+            os.path.abspath(os.sep), *([os.pardir] * 12), "token.json"
+        )
+        for candidate, expected in (
+            (refused_path, "must be named token.json"),
+            (outside_path, "escaped its allowed directory"),
+        ):
+            with self.subTest(candidate=candidate):
+                self.session._token_file = candidate
+                with self.assertRaises(SystemExit) as ctx:
+                    self.session.save(
+                        {
+                            "access_token": "SESSION-A",
+                            "refresh_token": "SESSION-R",
+                            "expires_in": 1800,
+                        }
+                    )
+                self.assertIn(expected, str(ctx.exception))
+
+        self.assertFalse(os.path.exists(refused_dir))
+
+
 class TokenCacheProtectionTest(unittest.TestCase):
     def setUp(self):
         self.temp_dir = tempfile.TemporaryDirectory()
@@ -556,6 +649,7 @@ class TokenCacheProtectionTest(unittest.TestCase):
         patcher = mock.patch.object(xero_client, "TOKEN_FILE", self.token_file)
         patcher.start()
         self.addCleanup(patcher.stop)
+        self.session = xero_client.TokenSession(self.token_file)
         self.tokens = {
             "access_token": "SYNTHETIC-ACCESS-UNIQUE-2904",
             "refresh_token": "SYNTHETIC-REFRESH-UNIQUE-8173",
@@ -590,7 +684,7 @@ class TokenCacheProtectionTest(unittest.TestCase):
 
     @unittest.skipUnless(os.name == "nt", "Windows cache is DPAPI-protected")
     def test_windows_cache_and_recovery_temp_never_hold_plaintext_tokens(self):
-        xero_client._persist_token_cache_unlocked(
+        self.session._persist_unlocked(
             self.tokens, legacy_migration=False
         )
         raw = self._raw()
@@ -611,7 +705,7 @@ class TokenCacheProtectionTest(unittest.TestCase):
             side_effect=PermissionError(32, "destination is held"),
         ), mock.patch.object(xero_client.time, "sleep"):
             with self.assertRaises(SystemExit):
-                xero_client._persist_token_cache_unlocked(
+                self.session._persist_unlocked(
                     replacement, legacy_migration=False
                 )
 
@@ -731,7 +825,7 @@ class TokenCacheProtectionTest(unittest.TestCase):
 
     @unittest.skipIf(os.name == "nt", "POSIX permission semantics required")
     def test_posix_plaintext_fallback_is_and_remains_owner_only(self):
-        xero_client._persist_token_cache_unlocked(
+        self.session._persist_unlocked(
             self.tokens, legacy_migration=False
         )
         self.assertEqual(
@@ -772,7 +866,7 @@ class TokenCacheProtectionTest(unittest.TestCase):
 
         with mock.patch.object(xero_client.os, "fdopen", side_effect=PartialWriter), \
                 self.assertRaises(OSError):
-            xero_client._persist_token_cache_unlocked(
+            self.session._persist_unlocked(
                 self.tokens, legacy_migration=False
             )
         self.assertFalse(os.path.exists(self.token_file))
@@ -804,7 +898,7 @@ class TokenCacheConcurrencyTest(unittest.TestCase):
         with mock.patch.object(xero_client, "TOKEN_FILE", self.token_file), \
                 mock.patch.object(xero_client, "TOKEN_LOCK_TIMEOUT", 0), \
                 mock.patch.object(xero_client, "_try_token_lock", return_value=False), \
-                mock.patch.object(xero_client, "_load_tokens_unlocked") as load_tokens:
+                mock.patch.object(xero_client.TokenSession, "_load_unlocked") as load_tokens:
             with self.assertRaises(SystemExit) as raised:
                 xero_client.get_access_token("client", "secret")
 
@@ -904,13 +998,14 @@ class RefreshRejectionTest(unittest.TestCase):
         patcher = mock.patch.object(xero_client, "TOKEN_FILE", self.token_file)
         patcher.start()
         self.addCleanup(patcher.stop)
+        self.session = xero_client.TokenSession(self.token_file)
         cached = {
             "access_token": "OLD-A",
             "refresh_token": "OLD-R",
             "expires_in": 1800,
             "obtained_at": 0.0,
         }
-        xero_client._persist_token_cache_unlocked(cached, legacy_migration=False)
+        self.session._persist_unlocked(cached, legacy_migration=False)
         with open(self.token_file, "rb") as source:
             self.before = source.read()
 
@@ -1043,13 +1138,13 @@ class ResolveTokenFileTest(unittest.TestCase):
                 os.path.normcase(os.path.realpath(cache_path)),
             )
             with mock.patch.object(xero_client, "TOKEN_FILE", resolved):
-                with xero_client._token_cache_lock():
+                with xero_client.TokenSession(resolved)._locked():
                     pass
             self.assertTrue(os.path.exists(cache_path + ".lock"))
 
 
 class TokenCacheLockGuardTest(unittest.TestCase):
-    """_token_cache_lock validates TOKEN_FILE through token_store.safe_token_path.
+    """TokenSession validates its path through token_store.safe_token_path.
 
     TOKEN_FILE is reassigned from --token-file, from XERO_TOKEN_FILE, and from
     a XERO_TOKEN_FILE in .env, so the value reaching the lock is caller-supplied.
@@ -1059,38 +1154,31 @@ class TokenCacheLockGuardTest(unittest.TestCase):
 
     def test_path_outside_every_allowed_root_is_refused(self):
         outside = os.path.join(os.path.abspath(os.sep), *([os.pardir] * 12), "token.json")
-        with mock.patch.object(xero_client, "TOKEN_FILE", outside):
-            with self.assertRaises(SystemExit) as ctx:
-                with xero_client._token_cache_lock():
-                    pass
+        with self.assertRaises(SystemExit) as ctx:
+            xero_client.TokenSession(outside)
         self.assertIn("must stay under", str(ctx.exception))
 
     def test_cache_named_anything_but_token_json_is_refused(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             wrong_name = os.path.join(temp_dir, "cache.json")
-            with mock.patch.object(xero_client, "TOKEN_FILE", wrong_name):
-                with self.assertRaises(SystemExit) as ctx:
-                    with xero_client._token_cache_lock():
-                        pass
+            with self.assertRaises(SystemExit) as ctx:
+                xero_client.TokenSession(wrong_name)
         self.assertIn("must be named token.json", str(ctx.exception))
 
     def test_a_refused_path_creates_no_directory_and_no_lock_file(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             unwanted_dir = os.path.join(temp_dir, "unwanted")
             wrong_name = os.path.join(unwanted_dir, "cache.json")
-            with mock.patch.object(xero_client, "TOKEN_FILE", wrong_name):
-                with self.assertRaises(SystemExit):
-                    with xero_client._token_cache_lock():
-                        pass
+            with self.assertRaises(SystemExit):
+                xero_client.TokenSession(wrong_name)
             self.assertFalse(os.path.exists(unwanted_dir))
             self.assertFalse(os.path.exists(wrong_name + ".lock"))
 
     def test_an_allowed_path_still_takes_the_lock_and_makes_its_directory(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             cache_path = os.path.join(temp_dir, "nested", "token.json")
-            with mock.patch.object(xero_client, "TOKEN_FILE", cache_path):
-                with xero_client._token_cache_lock():
-                    pass
+            with xero_client.TokenSession(cache_path)._locked():
+                pass
             self.assertTrue(os.path.isdir(os.path.dirname(cache_path)))
             self.assertTrue(os.path.exists(cache_path + ".lock"))
 

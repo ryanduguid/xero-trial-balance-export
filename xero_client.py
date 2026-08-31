@@ -30,7 +30,7 @@ from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, Callable, cast
 
 import requests
 
@@ -38,8 +38,8 @@ TOKEN_URL = "https://identity.xero.com/connect/token"
 CONNECTIONS_URL = "https://api.xero.com/connections"
 from token_store import (  # noqa: E402
     DEFAULT_TOKEN_FILE,
+    allowed_token_roots,
     resolve_token_file,
-    safe_token_path,
 )
 
 TOKEN_FILE = resolve_token_file()
@@ -371,52 +371,6 @@ def _release_token_lock(lock_file) -> None:
         fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
 
 
-@contextmanager
-def _token_cache_lock():
-    """Hold the cross-process lock for TOKEN_FILE's cache transaction.
-
-    TOKEN_FILE is reassigned by export_tb.py and auth.py after they parse a
-    command line and load .env, so it can still carry a --token-file value
-    or a XERO_TOKEN_FILE set in either place. Validate it here, through the
-    one validator in token_store, before any directory is created or any
-    file is opened from it.
-    """
-    token_file = safe_token_path(TOKEN_FILE)
-    lock_path = token_file + ".lock"
-    try:
-        os.makedirs(os.path.dirname(token_file) or ".", exist_ok=True)
-        lock_file = open(lock_path, "a+b")
-    except OSError as exc:
-        raise SystemExit(
-            f"error: could not open the token cache lock {lock_path} ({exc}); "
-            "token.json was not read or changed."
-        ) from None
-
-    try:
-        # msvcrt locks a byte range. Ensure byte zero exists; this file never
-        # contains token material or any other process data.
-        if os.fstat(lock_file.fileno()).st_size == 0:
-            lock_file.write(b"\0")
-            lock_file.flush()
-
-        deadline = time.monotonic() + TOKEN_LOCK_TIMEOUT
-        while not _try_token_lock(lock_file):
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                raise SystemExit(
-                    f"error: another process held the token cache lock for "
-                    f"{TOKEN_LOCK_TIMEOUT}s; token.json was not read or changed."
-                )
-            time.sleep(min(TOKEN_LOCK_POLL, remaining))
-
-        try:
-            yield
-        finally:
-            _release_token_lock(lock_file)
-    finally:
-        lock_file.close()
-
-
 def _expires_in_is_usable(value: object) -> bool:
     return type(value) is int and 1 <= value <= 86400
 
@@ -588,188 +542,271 @@ def durable_replace(
             os.unlink(tmp_path)
 
 
-def save_tokens(token_response: dict) -> None:
-    """Serialise and atomically persist a token endpoint response."""
-    with _token_cache_lock():
-        _save_tokens_unlocked(token_response)
+class TokenSession:
+    """Own one token cache's locked read, migration, save and rotation state."""
 
-
-def _save_tokens_unlocked(token_response: dict) -> None:
-    """Persist a token endpoint response atomically, stamped with obtained_at.
-
-    The temp file is deleted only when it holds nothing worth keeping. Once
-    the JSON has been written and flushed, that file is the only copy of the
-    freshly issued refresh token: token.json still holds the previous one,
-    which Xero has already consumed. If the fsync or the replace cannot be
-    made to stick, the temp file survives and its path goes into the error
-    message, so the pair can be recovered by hand inside Xero's 30-minute
-    grace window.
-    """
-    data = dict(token_response)
-    data["obtained_at"] = time.time()
-    _persist_token_cache_unlocked(data, legacy_migration=False)
-
-
-def _persist_token_cache_unlocked(data: dict, *, legacy_migration: bool) -> None:
-    """Write a complete cache document through the existing atomic path.
-
-    Encoding happens in memory before a temp file exists.  On Windows that
-    means neither the destination nor any recovery temp ever receives the
-    plaintext token pair.  ``legacy_migration`` changes only the recovery
-    message: no refresh token has been spent and the original plaintext cache
-    remains usable until the encrypted replacement succeeds.
-    """
-    encoded = _encode_token_cache(data)
-    fd, tmp_path = tempfile.mkstemp(dir=os.path.dirname(TOKEN_FILE), suffix=".tmp")
-    try:
-        _enforce_owner_only(tmp_path)
-    except BaseException:
-        os.close(fd)
-        if os.path.exists(tmp_path):
-            os.unlink(tmp_path)
-        raise
-
-    def write_encoded(fh) -> None:
-        if fh.write(encoded) != len(encoded):
-            raise OSError("short write while saving token cache")
-
-    if legacy_migration:
-
-        def fsync_error(exc: OSError) -> str:
-            return (
-                f"error: wrote an encrypted replacement for the legacy "
-                f"token cache to {tmp_path} but could not flush it to "
-                f"disk ({exc}). {TOKEN_FILE} was left unchanged and no "
-                "Xero request was made. Delete the temp file and retry."
+    def __init__(self, token_file: str | None = None) -> None:
+        resolved = resolve_token_file(token_file)
+        for root in allowed_token_roots():
+            if resolved.startswith(root + os.sep):
+                self._allowed_root = root
+                break
+        else:
+            raise SystemExit(
+                "error: token cache path must stay under the home directory, "
+                "the process working directory, the system temp directory, "
+                "or the install directory."
             )
+        self._token_file = resolved
 
-        def replace_error(last_error: OSError | None) -> str:
-            return (
-                f"error: wrote an encrypted replacement for the legacy token "
-                f"cache to {tmp_path} but could not move it onto {TOKEN_FILE} "
-                f"after {REPLACE_ATTEMPTS} attempts ({last_error}). The legacy "
-                "cache was left unchanged and no Xero request was made. Delete "
-                "the temp file and retry."
-            )
+    @property
+    def token_file(self) -> str:
+        """Return this session's fixed, resolved cache path."""
+        return self._token_file
 
-    else:
+    @contextmanager
+    def _locked(self):
+        """Hold the cross-process lock for this cache transaction."""
+        token_file = os.path.realpath(
+            os.path.abspath(os.path.expanduser(self._token_file))
+        )
+        if os.path.basename(token_file) != "token.json":
+            raise SystemExit("error: token cache path must be named token.json")
+        if not token_file.startswith(self._allowed_root + os.sep):
+            raise SystemExit("error: token cache path escaped its allowed directory")
+        lock_path = token_file + ".lock"
+        try:
+            os.makedirs(os.path.dirname(token_file) or ".", exist_ok=True)
+            lock_file = open(lock_path, "a+b")
+        except OSError as exc:
+            raise SystemExit(
+                f"error: could not open the token cache lock {lock_path} ({exc}); "
+                "token.json was not read or changed."
+            ) from None
 
-        def fsync_error(exc: OSError) -> str:
-            return (
-                f"error: wrote the new Xero token pair to {tmp_path} but "
-                f"could not flush it to disk ({exc}). {TOKEN_FILE} still "
-                f"holds the refresh token Xero has already consumed, so "
-                f"leave it alone: copy {tmp_path} over {TOKEN_FILE} "
-                "within Xero's 30-minute rotation grace window, or run: "
-                "python auth.py"
-            )
+        try:
+            # msvcrt locks a byte range. Ensure byte zero exists; this file
+            # never contains token material or any other process data.
+            if os.fstat(lock_file.fileno()).st_size == 0:
+                lock_file.write(b"\0")
+                lock_file.flush()
 
-        def replace_error(last_error: OSError | None) -> str:
-            return (
-                f"error: wrote the new Xero token pair to {tmp_path} but could not "
-                f"move it onto {TOKEN_FILE} after {REPLACE_ATTEMPTS} attempts "
-                f"({last_error}). {TOKEN_FILE} still holds the refresh token Xero "
-                f"has already consumed, so leave it alone: copy {tmp_path} over "
-                f"{TOKEN_FILE} within Xero's 30-minute rotation grace window, or "
-                "run: python auth.py"
-            )
+            deadline = time.monotonic() + TOKEN_LOCK_TIMEOUT
+            while not _try_token_lock(lock_file):
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise SystemExit(
+                        f"error: another process held the token cache lock for "
+                        f"{TOKEN_LOCK_TIMEOUT}s; token.json was not read or changed."
+                    )
+                time.sleep(min(TOKEN_LOCK_POLL, remaining))
 
-    durable_replace(
-        fd,
-        tmp_path,
-        TOKEN_FILE,
-        lambda f: os.fdopen(f, "wb"),
-        write_encoded,
-        fsync_error=fsync_error,
-        replace_error=replace_error,
+            try:
+                yield
+            finally:
+                _release_token_lock(lock_file)
+        finally:
+            lock_file.close()
+
+    def _persist_unlocked(self, data: dict, *, legacy_migration: bool) -> None:
+        """Write a complete cache document through the atomic replacement path."""
+        token_file = os.path.realpath(
+            os.path.abspath(os.path.expanduser(self._token_file))
+        )
+        if os.path.basename(token_file) != "token.json":
+            raise SystemExit("error: token cache path must be named token.json")
+        if not token_file.startswith(self._allowed_root + os.sep):
+            raise SystemExit("error: token cache path escaped its allowed directory")
+        encoded = _encode_token_cache(data)
+        fd, tmp_path = tempfile.mkstemp(dir=os.path.dirname(token_file), suffix=".tmp")
+        try:
+            _enforce_owner_only(tmp_path)
+        except BaseException:
+            os.close(fd)
+            if os.path.exists(tmp_path):
+                os.unlink(tmp_path)
+            raise
+
+        def write_encoded(fh) -> None:
+            if fh.write(encoded) != len(encoded):
+                raise OSError("short write while saving token cache")
+
+        if legacy_migration:
+
+            def fsync_error(exc: OSError) -> str:
+                return (
+                    f"error: wrote an encrypted replacement for the legacy "
+                    f"token cache to {tmp_path} but could not flush it to "
+                    f"disk ({exc}). {token_file} was left unchanged and no "
+                    "Xero request was made. Delete the temp file and retry."
+                )
+
+            def replace_error(last_error: OSError | None) -> str:
+                return (
+                    f"error: wrote an encrypted replacement for the legacy token "
+                    f"cache to {tmp_path} but could not move it onto "
+                    f"{token_file} after {REPLACE_ATTEMPTS} attempts "
+                    f"({last_error}). The legacy cache was left unchanged and no "
+                    "Xero request was made. Delete the temp file and retry."
+                )
+
+        else:
+
+            def fsync_error(exc: OSError) -> str:
+                return (
+                    f"error: wrote the new Xero token pair to {tmp_path} but "
+                    f"could not flush it to disk ({exc}). {token_file} still "
+                    f"holds the refresh token Xero has already consumed, so "
+                    f"leave it alone: copy {tmp_path} over {token_file} "
+                    "within Xero's 30-minute rotation grace window, or run: "
+                    "python auth.py"
+                )
+
+            def replace_error(last_error: OSError | None) -> str:
+                return (
+                    f"error: wrote the new Xero token pair to {tmp_path} but "
+                    f"could not move it onto {token_file} after "
+                    f"{REPLACE_ATTEMPTS} attempts ({last_error}). "
+                    f"{token_file} still holds the refresh token Xero has "
+                    f"already consumed, so leave it alone: copy {tmp_path} over "
+                    f"{token_file} within Xero's 30-minute rotation grace "
+                    "window, or run: python auth.py"
+                )
+
+        durable_replace(
+            fd,
+            tmp_path,
+            token_file,
+            lambda f: os.fdopen(f, "wb"),
+            write_encoded,
+            fsync_error=fsync_error,
+            replace_error=replace_error,
+        )
+
+    def _save_unlocked(self, token_response: dict) -> None:
+        """Persist a newly issued pair before any caller can use it."""
+        data = dict(token_response)
+        data["obtained_at"] = time.time()
+        self._persist_unlocked(data, legacy_migration=False)
+
+    def save(self, token_response: dict) -> None:
+        """Serialise and atomically persist a token endpoint response."""
+        with self._locked():
+            self._save_unlocked(token_response)
+
+    def _load_unlocked(self) -> dict:
+        token_file = os.path.realpath(
+            os.path.abspath(os.path.expanduser(self._token_file))
+        )
+        if os.path.basename(token_file) != "token.json":
+            raise SystemExit("error: token cache path must be named token.json")
+        if not token_file.startswith(self._allowed_root + os.sep):
+            raise SystemExit("error: token cache path escaped its allowed directory")
+        if not os.path.exists(token_file):
+            raise SystemExit("No token.json - run: python auth.py")
+        try:
+            if not _is_windows():
+                # The explicit fallback is plaintext, so tighten an inherited
+                # or copied mode before this process reads any token bytes.
+                _enforce_owner_only(token_file)
+            with open(token_file, "rb") as fh:
+                raw = fh.read()
+        except OSError as exc:
+            raise SystemExit(
+                f"error: token.json could not be read ({exc}); the file was left "
+                "unchanged. Run: python auth.py"
+            ) from None
+
+        tokens, legacy_plaintext = _decode_token_cache(raw)
+        validate_token_response(tokens, label="token.json", cached=True)
+        if legacy_plaintext and _is_windows():
+            # Migration stays inside the same transaction and does not restamp
+            # obtained_at, so an old access token cannot look newly issued.
+            self._persist_unlocked(tokens, legacy_migration=True)
+        return tokens
+
+    def load(self) -> dict:
+        """Read and validate the cache, serialising any Windows migration."""
+        with self._locked():
+            return self._load_unlocked()
+
+    def access_token(
+        self,
+        refresh: Callable[[str], object],
+        *,
+        force: bool = False,
+    ) -> str:
+        """Return a live access token and atomically persist any rotated pair."""
+        with self._locked():
+            tokens = self._load_unlocked()
+            age = time.time() - tokens["obtained_at"]
+            fresh = -TOKEN_CLOCK_SKEW <= age < tokens["expires_in"] - EXPIRY_MARGIN
+            if not force and fresh:
+                return tokens["access_token"]
+
+            new_tokens = validate_rotated_response(refresh(tokens["refresh_token"]))
+            self._save_unlocked(new_tokens)
+            return new_tokens["access_token"]
+
+
+def _request_rotated_tokens(
+    refresh_token: str, client_id: str, client_secret: str
+) -> object:
+    """Exchange one refresh token; cache state remains outside this HTTP seam."""
+    resp = requests.post(
+        TOKEN_URL,
+        data={
+            "grant_type": "refresh_token",
+            "refresh_token": refresh_token,
+        },
+        auth=(client_id, client_secret),
+        timeout=30,
     )
-
-
-def _load_tokens_unlocked() -> dict:
-    if not os.path.exists(TOKEN_FILE):
-        raise SystemExit("No token.json - run: python auth.py")
-    try:
-        if not _is_windows():
-            # The explicit fallback is plaintext, so tighten an inherited or
-            # copied mode before any token bytes are read by this process.
-            _enforce_owner_only(TOKEN_FILE)
-        with open(TOKEN_FILE, "rb") as fh:
-            raw = fh.read()
-    except OSError as exc:
+    if resp.status_code == 400 and "invalid_grant" in resp.text:
         raise SystemExit(
-            f"error: token.json could not be read ({exc}); the file was left "
-            "unchanged. Run: python auth.py"
+            "Refresh token rejected (already used or expired). "
+            "Re-authorise with: python auth.py"
+        )
+    if resp.status_code == 401:
+        raise SystemExit(
+            "Xero rejected this app's credentials when refreshing the token "
+            "(HTTP 401). Check XERO_CLIENT_ID and XERO_CLIENT_SECRET in .env "
+            "against the app at developer.xero.com; token.json was left "
+            "as it was."
+        )
+    resp.raise_for_status()
+    try:
+        return resp.json()
+    except ValueError:
+        raise SystemExit(
+            "error: Xero returned a non-JSON token response; the existing "
+            "token cache was left untouched."
         ) from None
 
-    tokens, legacy_plaintext = _decode_token_cache(raw)
-    validate_token_response(tokens, label="token.json", cached=True)
-    if legacy_plaintext and _is_windows():
-        # The caller holds the same interprocess lock as refresh.  Finish this
-        # atomic rewrite before it is possible to reach requests.post, and do
-        # not restamp obtained_at: migration must not make an old access token
-        # look newly issued.
-        _persist_token_cache_unlocked(tokens, legacy_migration=True)
-    return tokens
+
+def _current_token_session() -> TokenSession:
+    """Bridge the mutable compatibility path into an immutable transaction."""
+    return TokenSession(TOKEN_FILE)
+
+
+def save_tokens(token_response: dict) -> None:
+    """Compatibility wrapper for auth.py and existing callers."""
+    _current_token_session().save(token_response)
 
 
 def load_tokens() -> dict:
-    """Read and validate the cache, serialising any Windows legacy migration."""
-    with _token_cache_lock():
-        return _load_tokens_unlocked()
+    """Compatibility wrapper for callers that read the current cache."""
+    return _current_token_session().load()
 
 
 def get_access_token(client_id: str, client_secret: str, force: bool = False) -> str:
-    """Return a live access token, refreshing (and re-persisting) if needed.
-
-    force=True skips the local expiry check, for when a cached token looked
-    fresh but Xero returned 401 anyway (skewed clock, token.json copied from
-    another machine). The lock is taken before token.json is read, so a waiter
-    sees a token pair another process has already rotated instead of spending
-    the same single-use refresh token concurrently.
-    """
-    with _token_cache_lock():
-        tokens = _load_tokens_unlocked()
-        age = time.time() - tokens["obtained_at"]
-        if not force and -TOKEN_CLOCK_SKEW <= age < tokens["expires_in"] - EXPIRY_MARGIN:
-            return tokens["access_token"]
-
-        resp = requests.post(
-            TOKEN_URL,
-            data={
-                "grant_type": "refresh_token",
-                "refresh_token": tokens["refresh_token"],
-            },
-            auth=(client_id, client_secret),
-            timeout=30,
-        )
-        if resp.status_code == 400 and "invalid_grant" in resp.text:
-            raise SystemExit(
-                "Refresh token rejected (already used or expired). "
-                "Re-authorise with: python auth.py"
-            )
-        # A mistyped XERO_CLIENT_SECRET is the other everyday failure here, and
-        # the token endpoint answers it with 401 (OAuth2 invalid_client). Without
-        # this branch raise_for_status printed a bare HTTPError traceback naming
-        # the identity endpoint, which reads as a Xero outage rather than a typo
-        # in .env. The stored refresh token is untouched either way.
-        if resp.status_code == 401:
-            raise SystemExit(
-                "Xero rejected this app's credentials when refreshing the token "
-                "(HTTP 401). Check XERO_CLIENT_ID and XERO_CLIENT_SECRET in .env "
-                "against the app at developer.xero.com; token.json was left "
-                "as it was."
-            )
-        resp.raise_for_status()
-        try:
-            new_tokens = resp.json()
-        except ValueError:
-            raise SystemExit(
-                "error: Xero returned a non-JSON token response; the existing "
-                "token cache was left untouched."
-            ) from None
-        new_tokens = validate_rotated_response(new_tokens)
-        _save_tokens_unlocked(new_tokens)  # persist BEFORE using (rotation safety)
-        return new_tokens["access_token"]
+    """Return a live access token through the current cache session."""
+    return _current_token_session().access_token(
+        lambda refresh_token: _request_rotated_tokens(
+            refresh_token, client_id, client_secret
+        ),
+        force=force,
+    )
 
 
 def api_get(

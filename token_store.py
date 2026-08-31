@@ -24,7 +24,7 @@ def _state_home_token_file() -> str:
     return os.path.join(home, ".local", "state", "xero-trial-balance-export", "token.json")
 
 
-def _allowed_token_roots() -> tuple[str, ...]:
+def allowed_token_roots() -> tuple[str, ...]:
     """Directories the token cache may live under.
 
     Resolved on every call, not once at import, so a process that changes
@@ -53,7 +53,7 @@ def safe_token_path(path: str) -> str:
     candidate = os.path.realpath(os.path.abspath(os.path.expanduser(path)))
     if os.path.basename(candidate) != "token.json":
         raise SystemExit("error: token cache path must be named token.json")
-    for root in _allowed_token_roots():
+    for root in allowed_token_roots():
         if candidate == root or candidate.startswith(root + os.sep):
             return candidate
     raise SystemExit(

@@ -1,0 +1,21 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1000" height="420" viewBox="0 0 1000 420" role="img" aria-labelledby="title desc">
+  <title id="title">Validated fabricated Xero trial balance</title>
+  <desc id="desc">A fabricated ten-row trial balance with balanced movement and year-to-date totals.</desc>
+  <rect width="1000" height="420" rx="20" fill="#07051a"/>
+  <rect x="34" y="34" width="932" height="352" rx="14" fill="#100d29" stroke="#6155a6"/>
+  <text x="68" y="84" fill="#f4f1ff" font-family="ui-monospace, SFMono-Regular, Consolas, monospace" font-size="28" font-weight="700">xero-trial-balance-export</text>
+  <text x="68" y="116" fill="#9e96c8" font-family="ui-monospace, SFMono-Regular, Consolas, monospace" font-size="15">FABRICATED OFFLINE PROOF  |  2026-06-30</text>
+  <line x1="68" y1="142" x2="932" y2="142" stroke="#38305f"/>
+  <text x="68" y="184" fill="#b9b3d8" font-family="ui-monospace, SFMono-Regular, Consolas, monospace" font-size="18">tenant</text>
+  <text x="260" y="184" fill="#ffffff" font-family="ui-monospace, SFMono-Regular, Consolas, monospace" font-size="18">Catherby Fisheries Pty Ltd</text>
+  <text x="68" y="224" fill="#b9b3d8" font-family="ui-monospace, SFMono-Regular, Consolas, monospace" font-size="18">shape</text>
+  <text x="260" y="224" fill="#ffffff" font-family="ui-monospace, SFMono-Regular, Consolas, monospace" font-size="18">10 account rows  |  10 columns</text>
+  <text x="68" y="264" fill="#b9b3d8" font-family="ui-monospace, SFMono-Regular, Consolas, monospace" font-size="18">movement</text>
+  <text x="260" y="264" fill="#ffffff" font-family="ui-monospace, SFMono-Regular, Consolas, monospace" font-size="18">DR $5,700.00  |  CR $5,700.00</text>
+  <text x="68" y="304" fill="#b9b3d8" font-family="ui-monospace, SFMono-Regular, Consolas, monospace" font-size="18">year to date</text>
+  <text x="260" y="304" fill="#ffffff" font-family="ui-monospace, SFMono-Regular, Consolas, monospace" font-size="18">DR $126,334.50  |  CR $126,334.50</text>
+  <rect x="742" y="238" width="168" height="58" rx="29" fill="#183d35" stroke="#54d3ae"/>
+  <text x="826" y="274" text-anchor="middle" fill="#8ff0d2" font-family="ui-monospace, SFMono-Regular, Consolas, monospace" font-size="18" font-weight="700">BALANCED</text>
+  <line x1="68" y1="330" x2="932" y2="330" stroke="#38305f"/>
+  <text x="68" y="360" fill="#9e96c8" font-family="ui-monospace, SFMono-Regular, Consolas, monospace" font-size="15">python tools/render_quick_proof.py --check</text>
+</svg>

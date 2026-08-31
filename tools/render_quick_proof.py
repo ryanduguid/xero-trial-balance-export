@@ -13,6 +13,18 @@ ROOT = Path(__file__).resolve().parents[1]
 SAMPLE = ROOT / "samples" / "sample-output.csv"
 SVG = ROOT / "assets" / "quick-proof.svg"
 TRANSCRIPT = ROOT / "assets" / "quick-proof.md"
+EXPECTED_COLUMNS = (
+    "ReportDate",
+    "Tenant",
+    "Section",
+    "AccountID",
+    "AccountName",
+    "AccountCode",
+    "Debit",
+    "Credit",
+    "YTDDebit",
+    "YTDCredit",
+)
 
 
 def _money(value: Decimal) -> str:
@@ -21,9 +33,20 @@ def _money(value: Decimal) -> str:
 
 def _summary() -> dict[str, str | int]:
     with SAMPLE.open(encoding="utf-8-sig", newline="") as handle:
-        rows = list(csv.DictReader(handle))
+        reader = csv.DictReader(handle)
+        columns = tuple(reader.fieldnames or ())
+        rows = list(reader)
     if not rows:
         raise ValueError("the fabricated sample has no account rows")
+    if columns != EXPECTED_COLUMNS:
+        raise ValueError("the fabricated sample has unexpected columns")
+
+    tenants = {row["Tenant"] for row in rows}
+    if len(tenants) != 1:
+        raise ValueError("the fabricated sample has multiple tenants")
+    report_dates = {row["ReportDate"] for row in rows}
+    if len(report_dates) != 1:
+        raise ValueError("the fabricated sample has multiple report dates")
 
     totals = {
         column: sum((Decimal(row[column]) for row in rows), Decimal())
@@ -34,9 +57,10 @@ def _summary() -> dict[str, str | int]:
     if totals["YTDDebit"] != totals["YTDCredit"]:
         raise ValueError("the fabricated YTD columns do not balance")
     return {
-        "tenant": rows[0]["Tenant"],
-        "date": rows[0]["ReportDate"],
+        "tenant": tenants.pop(),
+        "date": report_dates.pop(),
         "rows": len(rows),
+        "columns": len(columns),
         "movement": _money(totals["Debit"]),
         "ytd": _money(totals["YTDDebit"]),
     }
@@ -49,7 +73,7 @@ Source: [`samples/sample-output.csv`](../samples/sample-output.csv)
 
 - Tenant: {summary['tenant']}
 - Report date: {summary['date']}
-- Shape: {summary['rows']} account rows, 10 columns
+- Shape: {summary['rows']} account rows, {summary['columns']} columns
 - Movement: debit {summary['movement']} | credit {summary['movement']} | balanced
 - YTD: debit {summary['ytd']} | credit {summary['ytd']} | balanced
 
@@ -69,9 +93,10 @@ def render_svg(summary: dict[str, str | int]) -> str:
     movement = html.escape(str(summary["movement"]))
     ytd = html.escape(str(summary["ytd"]))
     rows = summary["rows"]
+    columns = summary["columns"]
     return f"""<svg xmlns="http://www.w3.org/2000/svg" width="1000" height="420" viewBox="0 0 1000 420" role="img" aria-labelledby="title desc">
   <title id="title">Validated fabricated Xero trial balance</title>
-  <desc id="desc">A fabricated ten-row trial balance with balanced movement and year-to-date totals.</desc>
+  <desc id="desc">A fabricated {rows}-row trial balance with balanced movement and year-to-date totals.</desc>
   <rect width="1000" height="420" rx="20" fill="#07051a"/>
   <rect x="34" y="34" width="932" height="352" rx="14" fill="#100d29" stroke="#6155a6"/>
   <text x="68" y="84" fill="#f4f1ff" font-family="ui-monospace, SFMono-Regular, Consolas, monospace" font-size="28" font-weight="700">xero-trial-balance-export</text>
@@ -80,7 +105,7 @@ def render_svg(summary: dict[str, str | int]) -> str:
   <text x="68" y="184" fill="#b9b3d8" font-family="ui-monospace, SFMono-Regular, Consolas, monospace" font-size="18">tenant</text>
   <text x="260" y="184" fill="#ffffff" font-family="ui-monospace, SFMono-Regular, Consolas, monospace" font-size="18">{tenant}</text>
   <text x="68" y="224" fill="#b9b3d8" font-family="ui-monospace, SFMono-Regular, Consolas, monospace" font-size="18">shape</text>
-  <text x="260" y="224" fill="#ffffff" font-family="ui-monospace, SFMono-Regular, Consolas, monospace" font-size="18">{rows} account rows  |  10 columns</text>
+  <text x="260" y="224" fill="#ffffff" font-family="ui-monospace, SFMono-Regular, Consolas, monospace" font-size="18">{rows} account rows  |  {columns} columns</text>
   <text x="68" y="264" fill="#b9b3d8" font-family="ui-monospace, SFMono-Regular, Consolas, monospace" font-size="18">movement</text>
   <text x="260" y="264" fill="#ffffff" font-family="ui-monospace, SFMono-Regular, Consolas, monospace" font-size="18">DR {movement}  |  CR {movement}</text>
   <text x="68" y="304" fill="#b9b3d8" font-family="ui-monospace, SFMono-Regular, Consolas, monospace" font-size="18">year to date</text>

@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1000" height="420" viewBox="0 0 1000 420" role="img" aria-labelledby="title desc">
   <title id="title">Validated fabricated Xero trial balance</title>
-  <desc id="desc">A fabricated ten-row trial balance with balanced movement and year-to-date totals.</desc>
+  <desc id="desc">A fabricated 10-row trial balance with balanced movement and year-to-date totals.</desc>
   <rect width="1000" height="420" rx="20" fill="#07051a"/>
   <rect x="34" y="34" width="932" height="352" rx="14" fill="#100d29" stroke="#6155a6"/>
   <text x="68" y="84" fill="#f4f1ff" font-family="ui-monospace, SFMono-Regular, Consolas, monospace" font-size="28" font-weight="700">xero-trial-balance-export</text>

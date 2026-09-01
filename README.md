@@ -68,6 +68,8 @@ The CSV is written as UTF-8 with a BOM (`utf-8-sig`): Excel's double-click open 
 3. Run the Windows task in the same Windows user profile that ran `auth.py`: current-user DPAPI is deliberately not a portable cache format, and a non-Windows process cannot decrypt it.
 4. Pin the output name with `--out`, as above. The default filename embeds the report date, so a bare scheduled run writes a new file every day while Power BI keeps refreshing the stale one from setup day.
 
+A ready-made query is committed at [`samples/power-bi-query.pq`](samples/power-bi-query.pq). Paste it into Power BI Desktop (Home → Transform data → New Source → Blank Query → Advanced Editor), set the path at the top, and it loads the ten exported columns with explicit types, refusing any file whose header is not the exporter's. Point it at the fabricated [`samples/sample-output.csv`](samples/sample-output.csv) to exercise the whole load path with no Xero connection. It types `AccountCode` as text on purpose: codes like `090` lose their leading zero as a number, which breaks slicers and joins back to the ledger.
+
 When a run hits a locked destination, a concurrent export, or a disk that refuses the final flush, see the "Power BI failure modes" appendix below.
 
 Two Xero platform limits worth knowing: uncertified apps connect to at most 25 organisations (the Demo Company doesn't count), and going past that requires App Partner certification.

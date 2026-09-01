@@ -10,6 +10,16 @@ The repository name is the public project identity; the `xero-trial-balance-expo
 
 For citation metadata, see [`CITATION.cff`](CITATION.cff) and the exact [`v0.1.4` release](https://github.com/ryanduguid/xero-trial-balance-export/releases/tag/v0.1.4). The API path is read-only and cannot write to the ledger; see [Scope and disclaimer](#scope-and-disclaimer) and the fabricated [`samples/sample-output.csv`](samples/sample-output.csv) output.
 
+## Quick proof
+
+[![Validated fabricated trial balance](assets/quick-proof.svg)](assets/quick-proof.md)
+
+The card is built from the fabricated sample. Recalculate both balance checks and confirm that the committed proof is current:
+
+```bash
+python tools/render_quick_proof.py --check
+```
+
 ## Why
 
 The manual path (Reports → Trial Balance → Export → fix the header rows → fix the account codes) burns 10 minutes per entity per month and produces a slightly different file each time. The API path produces the same tidy shape every run:
@@ -37,7 +47,7 @@ Reproduce the offline movement and YTD gate with the fabricated fixtures in the 
 python export_tb.py --date 2026-06-30
 ```
 
-Options: `--tenant "name-or-id"` (name substring, or an exact `tenantId` when display names collide), `--out relative/path.csv`, `--payments-only` (cash basis), `--token-file path/to/token.json` (where the token cache lives; the flag beats the `XERO_TOKEN_FILE` environment variable, and the default is the per-user state directory — `~/.local/state/xero-trial-balance-export/token.json` on Unix, `%LOCALAPPDATA%\xero-trial-balance-export\token.json` on Windows. An existing `token.json` beside `xero_client.py` is still used so older clones keep working). `--out` must be a `.csv` path beneath the process working directory; absolute paths outside the working directory, `..` traversal and paths through an existing symlink that escapes that directory are rejected. A missing parent directory under `--out` is created rather than refused (`--out exports/tb.csv` makes `exports/` if it is not there), so a fetched report is never thrown away for want of a folder. Default filename: `{tenant}-{tenantid8}-tb-{date}-{accrual|cash}.csv`, so the two bases never overwrite each other. The `{tenant}` segment is sanitised for filesystem safety; see the [Filename reference](#filename-reference) appendix for the exact rules and their edge cases.
+Options: `--tenant "name-or-id"` (name substring, or an exact `tenantId` when display names collide), `--out relative/path.csv`, `--payments-only` (cash basis), `--token-file path/to/token.json` (where the token cache lives; the flag beats the `XERO_TOKEN_FILE` environment variable, and the default is the per-user state directory: `~/.local/state/xero-trial-balance-export/token.json` on Unix, `%LOCALAPPDATA%\xero-trial-balance-export\token.json` on Windows. An existing `token.json` beside `xero_client.py` is still used so older clones keep working). `--out` must be a `.csv` path beneath the process working directory; absolute paths outside the working directory, `..` traversal and paths through an existing symlink that escapes that directory are rejected. A missing parent directory under `--out` is created rather than refused (`--out exports/tb.csv` makes `exports/` if it is not there), so a fetched report is never thrown away for want of a folder. Default filename: `{tenant}-{tenantid8}-tb-{date}-{accrual|cash}.csv`, so the two bases never overwrite each other. The `{tenant}` segment is sanitised for filesystem safety; see the [Filename reference](#filename-reference) appendix for the exact rules and their edge cases.
 
 `--date` is an as-at date, not a range. Xero's `Reports/TrialBalance` endpoint takes
 only `date` and `paymentsOnly`, so this tool reproduces the `Trial Balance` report and

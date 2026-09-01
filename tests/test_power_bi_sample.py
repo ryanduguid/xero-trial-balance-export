@@ -88,6 +88,34 @@ class PowerBiSampleTests(unittest.TestCase):
             "the fabricated sample no longer demonstrates a leading-zero code",
         )
 
+    def test_the_parse_is_wider_than_the_contract(self) -> None:
+        """Csv.Document normalises to the column count it is handed, dropping
+        extra fields and padding short rows. Asking for exactly ten would
+        reshape a malformed file into the expected shape before the header
+        check could see it, so the query reads one column wider and treats
+        anything in that column as proof the file is too wide."""
+        code = _code_only()
+        self.assertIn("Columns = List.Count(ExpectedColumns) + 1", code)
+        self.assertNotIn("Columns = List.Count(ExpectedColumns),", code)
+
+    def test_each_malformed_shape_has_its_own_refusal(self) -> None:
+        code = _code_only()
+        for reason in (
+            "carries more than the ten columns",
+            "does not have the ten columns",
+            "does not carry all ten fields",
+        ):
+            self.assertIn(reason, code)
+        self.assertEqual(code.count("error Error.Record("), 3)
+
+    def test_the_typed_step_reads_the_fully_checked_table(self) -> None:
+        """Every refusal has to sit upstream of the types, or it is decorative."""
+        code = _code_only()
+        self.assertIn("Table.TransformColumnTypes(\n        Complete,", code)
+
+    def test_a_blank_trailing_line_is_not_treated_as_a_damaged_row(self) -> None:
+        self.assertIn("List.IsEmpty(List.RemoveNulls(Record.FieldValues(_)))", _code_only())
+
     def test_the_source_path_is_an_unusable_placeholder(self) -> None:
         """A path the reader must replace, not one that quietly half-works."""
         self.assertIn("CHANGE-ME", QUERY)

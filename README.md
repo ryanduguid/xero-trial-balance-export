@@ -1,5 +1,15 @@
 # xero-trial-balance-export
 
+> [!IMPORTANT]
+> **Repository migration: 3 September 2026.** We moved maintained development to
+> [`packages/xero-trial-balance-export`](https://github.com/ryanduguid/accounting-review-pipeline/tree/main/packages/xero-trial-balance-export)
+> in Accounting Review Pipeline.
+> The first replacement release is [`v0.1.6`](https://github.com/ryanduguid/accounting-review-pipeline/releases/tag/xero-trial-balance-export/v0.1.6).
+>
+> Keep this repository's [`v0.1.4`](https://github.com/ryanduguid/xero-trial-balance-export/releases/tag/v0.1.4)
+> as the rollback release until the fourteen-day observation window closes on
+> 17 September 2026. Open new issues and pull requests in Accounting Review Pipeline.
+
 ![xero-trial-balance-export](assets/banner.svg)
 
 [![Verify](https://github.com/ryanduguid/xero-trial-balance-export/actions/workflows/verify.yml/badge.svg)](https://github.com/ryanduguid/xero-trial-balance-export/actions/workflows/verify.yml) [![License: MIT](https://img.shields.io/badge/License-MIT-4F485E.svg?labelColor=04001F)](LICENSE) [![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-5C2D91.svg?logo=python&logoColor=white&labelColor=04001F)](https://www.python.org/downloads/)
